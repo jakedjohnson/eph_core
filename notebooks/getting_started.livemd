@@ -1,0 +1,216 @@
+# EphCore — Getting Started
+
+```elixir
+Mix.install(
+  [
+    {:eph_core, path: Path.join(__DIR__, "..")},
+    {:kino, "~> 0.14"}
+  ],
+  config: [
+    eph_core: [
+      # Planetary DE440s only. Avoid config_path: :eph_core here — that loads
+      # config.exs asteroid kernels before SPK.Server starts.
+      kernel_base_dir: Path.expand("../priv", __DIR__),
+      spk_kernels: ["de440s.bsp"]
+    ]
+  ]
+)
+
+Logger.configure(level: :warning)
+```
+
+## Overview
+
+Interactive lab for the pure-Elixir ephemeris engine. Change the observer, call
+`observe/4`, and compare geometric vs apparent frames without leaving the browser.
+This file is the front door: start here for one working result, then choose the
+mechanics path or the application path below.
+
+**How to open:** Install [Livebook](https://livebook.dev/), open this `.livemd`,
+evaluate the setup cell. Kernels must already be under `eph_core/priv/ephemeris/`
+(run `mix eph.download_kernels` in the repo first; the setup cell will not start without baseline files).
+
+## Tour paths
+
+The notebooks are split into two tracks.
+
+### 01 — Observe pipeline
+
+This path answers: if you call `observe/4`, what happens between the inputs and
+the celestial-sphere output?
+
+Use this path as the public-surface tour. The notebooks should call EphCore
+functions wherever possible; they should not teach readers to recreate core
+library behavior in notebook-local code.
+
+| Order | Notebook                                                                           | Topic                                                       |
+| ----- | ---------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| 1     | [`01_snapshot_pipeline.livemd`](01_observe_pipeline/01_snapshot_pipeline.livemd)   | Stage-by-stage `observe/4` walkthrough                      |
+| 2     | [`02_time_sidereal.livemd`](01_observe_pipeline/02_time_sidereal.livemd)           | UTC → sidereal time chain                                 |
+| 3     | [`03_kernels_chebyshev.livemd`](01_observe_pipeline/03_kernels_chebyshev.livemd)   | Implementation inspection: SPK records and curve evaluation |
+| 4     | [`04_celestial_geometry.livemd`](01_observe_pipeline/04_celestial_geometry.livemd) | Coordinate frames and the celestial sphere                  |
+| 5     | [`05_apparent_place.livemd`](01_observe_pipeline/05_apparent_place.livemd)         | Light-time, aberration, and topocentric look angles         |
+| 6     | [`06_time_series.livemd`](01_observe_pipeline/06_time_series.livemd)               | Repeated samples over time                                  |
+
+### 02 — Applications
+
+This path answers: what can you build with the dependency once the sky
+calculation is trustworthy?
+
+This is where application-shaped Elixir is allowed: fan-out, comparison,
+tables, charts, and examples that compose the package into a workflow.
+
+| Order | Notebook                                                                         | Topic                              |
+| ----- | -------------------------------------------------------------------------------- | ---------------------------------- |
+| 1     | [`01_almanac.livemd`](02_applications/01_almanac.livemd)                         | Rise / transit / set events        |
+| 2     | [`02_skyfield_snapshot.livemd`](02_applications/02_skyfield_snapshot.livemd)     | Optional Skyfield cross-check      |
+| 3     | [`03_fixed_stars.livemd`](02_applications/03_fixed_stars.livemd)                 | Hipparcos stars (optional catalog) |
+| 4     | [`04_retrograde_stations.livemd`](02_applications/04_retrograde_stations.livemd) | Retrograde loops and stations      |
+
+## Observe Minneapolis
+
+One cell sets the observer, checks the baseline kernel, calls `observe/4`, and
+renders the public API result: where each requested body appears on the local
+celestial sphere.
+
+```elixir
+minneapolis = %{lat: 44.9778, lon: -93.2650, height: 250}
+datetime = DateTime.utc_now() |> DateTime.truncate(:second)
+bodies = [:sun, :moon, :mercury, :venus, :mars, :jupiter, :saturn]
+
+priv = EphCore.Ephemeris.Kernels.base_dir()
+spk = Path.join([priv, "ephemeris", "spk", "de440s.bsp"])
+
+{us, {:ok, obs}} =
+  :timer.tc(fn ->
+    EphCore.observe(datetime, minneapolis, bodies)
+  end)
+
+sky_rows =
+  for body <- bodies do
+    sky = obs.bodies[body]
+    ssp = obs.solar_system_positions[body]
+    motion = obs.motion[body]
+
+    %{
+      body: body,
+      altitude_deg: Float.round(sky.altitude_deg, 2),
+      azimuth_deg: Float.round(sky.azimuth_deg, 2),
+      ecliptic_lon_deg: Float.round(ssp.ecliptic_longitude, 4),
+      lon_rate_deg_day: Float.round(motion.ecliptic_lon_rate_deg_per_day, 4),
+      retrograde: motion.retrograde,
+      range_km: Float.round(sky.topocentric_range_km, 0)
+    }
+  end
+
+Kino.render(
+  Kino.Markdown.new("""
+  **EphCore** `#{Application.spec(:eph_core, :vsn)}` · **#{DateTime.to_iso8601(datetime)}**<br>
+  Observer: Minneapolis `#{minneapolis.lat}, #{minneapolis.lon}` (#{minneapolis.height} m)<br>
+  SPK `de440s.bsp`: #{if File.exists?(spk), do: "present", else: "missing - run `mix eph.download_kernels`"}<br>
+  Runtime: **#{Float.round(us / 1000, 1)} ms**
+  """)
+)
+
+Kino.DataTable.new(sky_rows, name: "Geometric topocentric sky")
+```
+
+## Target Surface
+
+`EphCore.observe/4` currently accepts solar-system bodies from loaded SPK kernels:
+Sun, Moon, Mercury, Venus, Mars, Jupiter, Saturn, Uranus, Neptune, and Pluto.
+Generated asteroid kernels also work when the matching SPK file is installed and
+listed in `:spk_kernels`, for example `asteroids/2000001.bsp` for Ceres.
+Fixed stars are available through `EphCore.Stars.*` after `mix eph.setup_stars`,
+but they do not yet share the `observe/4` target list.
+
+Future releases should let callers pass one mixed list of planets, asteroid
+kernels, fixed stars, and later target sources into the same celestial-sphere
+API. See [`jakedjohnson/eph_core#1`](https://github.com/jakedjohnson/eph_core/issues/1).
+
+## Frame Choices
+
+A sky engine has to answer different questions with different frames.
+
+```text
+timestamp + target bodies
+        |
+        +--> geocentric state
+        |    Earth center, solar-system geometry
+        |    useful for orbits, almanac longitudes, stations, ingresses
+        |
+        +--> topocentric sky
+             observer latitude/longitude/height + Earth rotation
+             useful for altitude, azimuth, rising/setting, local experience
+```
+
+Topocentric calculations matter when the observer's place on Earth matters: the
+Moon shifts the most, horizon crossings move by location, and a person traveling
+through life does not keep one local sky. Astrology historically leans heavily
+on geocentric planetary longitudes, but location-sensitive ideas such as rising
+signs, houses, and visible transits require the observer's place on the rotating
+Earth. Apparent geocentric calculations matter less as a visible horizon picture
+and more when small longitude differences become timing differences, especially
+near slow motion or station points. The dependency exposes these choices because
+applications need to choose the frame that matches the question.
+
+## Same Instant, Many Observers
+
+A single timestamp can fan out across many observers. In a notebook,
+`Task.async_stream/3` is the small version: each location gets an independent
+local horizon. In a service, the same idea can become streaming results,
+supervised work, cached shared sky state, or per-observer runtime processes.
+
+```elixir
+cities = [
+  {"Minneapolis", 44.98, -93.27},
+  {"Austin", 30.27, -97.74},
+  {"London", 51.51, -0.13},
+  {"Tokyo", 35.68, 139.69},
+  {"Sydney", -33.87, 151.21},
+  {"Reykjavik", 64.15, -21.94},
+  {"Santiago", -33.45, -70.67},
+  {"Nairobi", -1.29, 36.82}
+]
+
+{fanout_us, city_rows} =
+  :timer.tc(fn ->
+    cities
+    |> Task.async_stream(
+      fn {name, lat, lon} ->
+        loc = %{lat: lat, lon: lon, height: 0}
+        {:ok, city_obs} = EphCore.observe(datetime, loc, [:sun, :moon, :saturn])
+
+        %{
+          city: name,
+          sun_alt: Float.round(city_obs.bodies.sun.altitude_deg, 1),
+          moon_alt: Float.round(city_obs.bodies.moon.altitude_deg, 1),
+          saturn_alt: Float.round(city_obs.bodies.saturn.altitude_deg, 1)
+        }
+      end,
+      ordered: true,
+      timeout: 30_000
+    )
+    |> Enum.map(fn {:ok, row} -> row end)
+  end)
+
+Kino.render(
+  Kino.Markdown.new(
+    "**#{length(cities)} cities × 3 bodies** in #{Float.round(fanout_us / 1000, 1)} ms"
+  )
+)
+
+Kino.DataTable.new(city_rows, name: "Sun / Moon / Saturn altitude by city")
+```
+
+This is the first application-shaped move beyond one snapshot: one verified
+calculation pipeline becomes a service primitive for many places, many people,
+and eventually many planning questions.
+
+## Next cells to try
+
+* Swap `datetime` for “the sky when Elixir 1.0 shipped” (`~U[2014-09-18T00:00:00Z]`).
+* Add `:uranus` / `:neptune` / `:pluto` and watch outer-planet light-time grow.
+* [`01_snapshot_pipeline.livemd`](01_observe_pipeline/01_snapshot_pipeline.livemd) — walk each pipeline stage.
+* [`02_skyfield_snapshot.livemd`](02_applications/02_skyfield_snapshot.livemd) — optional EphCore vs Skyfield diffs (Pythonx).
+* [`01_almanac.livemd`](02_applications/01_almanac.livemd) — graduate the fan-out cell into a year-long almanac.

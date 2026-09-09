@@ -1,0 +1,538 @@
+# SPK Kernels & Chebyshev — Deep Dive
+
+```elixir
+Mix.install(
+  [
+    {:eph_core, path: Path.expand("../..", __DIR__)},
+    {:kino, "~> 0.14"},
+    {:kino_vega_lite, "~> 0.1"}
+  ],
+  config: [
+    eph_core: [
+      # Planetary DE440s only. Avoid config_path: :eph_core here — that loads
+      # config.exs asteroid kernels before SPK.Server starts.
+      kernel_base_dir: Path.expand("../../priv", __DIR__),
+      spk_kernels: ["de440s.bsp"]
+    ]
+  ]
+)
+
+Logger.configure(level: :warning)
+```
+
+## Overview
+
+A deep dive for software engineers: how EphCore turns a NASA binary file into
+"where is Mars right now?" — with ordinary Elixir, no NIFs.
+
+### The metaphor (keep this in your head)
+
+NASA does **not** ship a giant CSV of planet XYZ every second. That would be
+enormous. Instead they ship **prebaked trajectory curves**: for each body, the
+file is split into short time windows (~16 days for planets). Each window holds
+a small list of numbers — think **animation keyframes / spline coefficients**,
+not physics equations you have to derive at runtime.
+
+Asking "where's Mars at this timestamp?" is the same shape as a cache lookup:
+
+1. **Find the shard** — which time window covers this instant?
+2. **Load the payload** — pull that window's numbers from an in-memory table (ETS).
+3. **Evaluate the curve** — plug normalized time into a tiny polynomial formula.
+
+That's the whole hot path. The rest of this notebook is just unpacking those
+three steps with real code and real kernels.
+
+**How to open:** Install [Livebook](https://livebook.dev/), open this `.livemd`,
+evaluate the setup cell.
+
+## Helpers
+
+```elixir
+alias VegaLite, as: Vl
+alias EphCore.Ephemeris
+alias EphCore.Ephemeris.Kernels.SPK
+alias EphCore.Ephemeris.Kernels.SPK.{Chebyshev, DAF, Segment, Type2}
+alias EphCore.AstronomicalTime.{JulianDay, TerrestrialTime}
+
+:ok
+```
+
+## Ready check
+
+```elixir
+priv = EphCore.Ephemeris.Kernels.base_dir()
+spk_path = Path.join([priv, "ephemeris", "spk", "de440s.bsp"])
+
+Kino.Markdown.new("""
+**EphCore** `#{Application.spec(:eph_core, :vsn)}` · priv `#{priv}`
+
+SPK `de440s.bsp`: #{if File.exists?(spk_path), do: "✅ present", else: "❌ missing — run `mix eph.download_kernels`"}
+""")
+```
+
+## 1 — Kernel health check
+
+On boot, a GenServer opens the SPK file and indexes every **segment** — one
+body-pair (e.g. Mars → solar-system barycenter) over a time span. Confirm the
+server is up and peek at a few segments.
+
+```elixir
+segments = SPK.segments()
+
+Kino.render(
+  Kino.Markdown.new("""
+SPK loaded? **#{SPK.loaded?()}** · Segment count: **#{length(segments)}**
+""")
+)
+
+segments
+|> Enum.take(5)
+|> Enum.map(fn seg ->
+  %{
+    target: seg.target,
+    center: seg.center,
+    data_type: seg.data_type,
+    start_epoch_s: seg.start_epoch,
+    end_epoch_s: seg.end_epoch
+  }
+end)
+|> Kino.DataTable.new(name: "First 5 segments")
+```
+
+## 2 — What is a kernel?
+
+An **SPK** (Spacecraft and Planet Kernel) is a binary blob from JPL. Under the
+hood it's a **DAF** — think "custom file format with a header + linked index +
+data pages," not a database you query with SQL. EphCore opens it with
+`File.open` / `:file.pread` and unpacks records with Elixir binary pattern
+matching (`<<>>`). No C NIFs, no ports.
+
+```mermaid
+graph TD
+    A["de440s.bsp on disk"] -->|"File.open :binary"| B[DAF header record]
+    B --> C[Summary records chain]
+    C --> D[Segment descriptors]
+    D --> E["Type 2 curve data arrays"]
+    B -->|"binary header match"| F[Endian detection]
+    F --> C
+```
+
+**Key insight:** `DAF` is the deserializer. It reads the header, walks a linked
+list of summary records (the index), and hands back segment descriptors — like
+parsing a custom binary protocol with `<<>>` on random-access chunks.
+
+```elixir
+{:ok, daf} = DAF.parse(spk_path)
+
+Kino.Markdown.new("""
+### DAF header fields
+
+| Field | Value |
+|-------|-------|
+| nd (doubles per summary) | `#{daf.nd}` |
+| ni (integers per summary) | `#{daf.ni}` |
+| endian | `#{daf.endian}` |
+| summary count | `#{length(daf.summaries)}` |
+""")
+```
+
+Each summary packs `nd` doubles (start/end epoch) and `ni` integers
+(target, center, frame, data_type, start_addr, end_addr) — the index
+entry that tells us where that body's curve data lives in the file.
+
+## 3 — From body name to geocentric position
+
+Friendly atoms like `:mars` map to **NAIF IDs** (JPL's integer body codes —
+same idea as an enum / foreign key). We look up Mars and Earth in the solar
+system's reference frame (SSB = "origin of the coordinate system"), then
+subtract to get a vector from Earth to Mars.
+
+```mermaid
+graph LR
+    A[":mars"] -->|"NAIF map"| B["4 (Mars barycenter)"]
+    B -->|"SPK.position_at(4, 0, s)"| C["Mars SSB (km)"]
+    D["Earth SSB (km)"] -->|subtract| E["Geocentric Mars (km)"]
+    C --> E
+```
+
+**NAIF ID map** (from `EphCore.Ephemeris`):
+
+```elixir
+naif_ids = %{
+  sun: 10, moon: 301,
+  mercury: 1, venus: 2, mars: 4,
+  jupiter: 5, saturn: 6, uranus: 7, neptune: 8, pluto: 9,
+  earth: 399, emb: 3, ssb: 0
+}
+
+Kino.DataTable.new(
+  Enum.map(naif_ids, fn {name, id} -> %{body: name, naif_id: id} end),
+  name: "NAIF IDs (DE440s)"
+)
+```
+
+Now let's call the full geocentric pipeline:
+
+```elixir
+utc = ~U[2026-07-21 17:00:00Z]
+tt = TerrestrialTime.from_utc(utc)
+jd_tt = JulianDay.from_datetime(tt)
+
+{:ok, mars} = Ephemeris.geocentric_state(jd_tt, :mars)
+
+Kino.Markdown.new("""
+### Mars geocentric state at #{DateTime.to_iso8601(utc)} UTC
+
+| Component | Value |
+|-----------|-------|
+| X (km) | `#{elem(mars.geocentric_position_km, 0) |> Float.round(3)}` |
+| Y (km) | `#{elem(mars.geocentric_position_km, 1) |> Float.round(3)}` |
+| Z (km) | `#{elem(mars.geocentric_position_km, 2) |> Float.round(3)}` |
+| Range (km) | `#{Float.round(mars.geocentric_range_km, 3)}` |
+| Range (AU) | `#{Float.round(mars.geocentric_range_km / 149_597_870.7, 6)}` |
+| Frame | `#{mars.frame}` |
+| Seconds past J2000 | `#{Float.round(mars.query_seconds_past_j2000, 3)}` |
+""")
+```
+
+## 4 — Inside `SPK.position_at/3`
+
+What happens when you call `SPK.position_at(4, 0, seconds)`?
+Remember the metaphor: **find the shard → load the payload → evaluate the curve.**
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant ETS
+    participant Type2
+    participant Curve
+
+    Caller->>ETS: lookup meta for body pair
+    ETS-->>Caller: segment metadata list
+    Caller->>Caller: pick segment covering this time
+    Caller->>Type2: find_record_index
+    Type2-->>Caller: window index
+    Caller->>ETS: lookup record for that window
+    ETS-->>Caller: mid, radius, X/Y/Z coeffs
+    Caller->>Curve: normalize time into window
+    Curve-->>Caller: t in -1..1
+    Caller->>Curve: evaluate X, Y, Z
+    Curve-->>Caller: position km
+```
+
+**ETS layout** (written once at load, read-only afterward — like a warm cache):
+
+* `{:meta, target, center}` → "which windows exist for this body pair?"
+* `{:record, target, center, index}` → "the curve numbers for window N"
+
+Coefficients are **pre-reversed** at load time so the hot path doesn't pay for
+`Enum.reverse/1` on every query — reverse once, evaluate many times.
+
+```elixir
+# Peek at the raw ETS meta entry for Mars (target=4, center=0)
+[{_key, metas}] = :ets.lookup(EphCore.Ephemeris.Kernels.SPK.Server, {:meta, 4, 0})
+meta = hd(metas)
+
+type2 = meta.type2
+
+Kino.Markdown.new("""
+### Mars (4→0) Type 2 directory — the shard index
+
+| Field | Value | Meaning |
+|-------|-------|---------|
+| init | `#{type2.init}` | First window start (s past J2000) |
+| intlen | `#{type2.intlen}` | Window length (s) |
+| rsize | `#{type2.rsize}` | Doubles stored per window |
+| n | `#{type2.n}` | How many windows |
+| coeff_count | `#{div(type2.rsize - 2, 3)}` | Numbers per axis in each window |
+| span (years) | `#{Float.round(type2.n * type2.intlen / 86400 / 365.25, 1)}` | Total coverage |
+""")
+```
+
+## 5 — Evaluating the curve (Chebyshev, without the headache)
+
+### What are we actually computing?
+
+Each window stores a short list of coefficients for X, Y, and Z. Evaluating the
+position is: **take those numbers + a time in [-1, 1], get a point on the curve.**
+
+Under the hood JPL uses Chebyshev polynomials (a particular basis that packs
+smooth paths efficiently — like choosing a good compression codec). You don't
+need the math identity sheet; treat it as "polynomial evaluation with a known
+fast algorithm."
+
+If you want the textbook form:
+
+$$
+x(t) = \sum_{k=0}^{N} c_k \cdot T_k(t), \quad t \in [-1, 1]
+$$
+
+### Step 1: Normalize time into the window
+
+Each record has a `mid` (center of the window) and `radius` (half-width). Map
+your absolute timestamp into local coordinates on [-1, 1] — same idea as
+normalizing a cache key into a shard's local offset:
+
+$$
+t = \frac{\text{epoch} - \text{mid}}{\text{radius}}
+$$
+
+```elixir
+j2000_jd = 2_451_545.0
+seconds = (jd_tt - j2000_jd) * 86_400.0
+
+index = Type2.find_record_index(type2, seconds)
+[{_key, {mid, radius, cx, cy, cz}}] =
+  :ets.lookup(EphCore.Ephemeris.Kernels.SPK.Server, {:record, 4, 0, index})
+
+t = Chebyshev.normalize_time(seconds, mid, radius)
+
+Kino.Markdown.new("""
+### Normalization for Mars at epoch
+
+| | Value |
+|--|-------|
+| epoch (s past J2000) | `#{Float.round(seconds, 3)}` |
+| record index | `#{index}` |
+| mid | `#{Float.round(mid, 3)}` |
+| radius | `#{Float.round(radius, 3)}` s = `#{Float.round(radius / 86400, 2)}` days |
+| **t** | `#{Float.round(t, 8)}` ∈ [-1, 1] ✓ |
+""")
+```
+
+### Step 2: Clenshaw — the fast evaluator (the hot path)
+
+Naively building each basis term and summing is quadratic. **Clenshaw** is the
+standard linear-time trick for this family of polynomials — cousin to Horner's
+method for ordinary polynomials. One tight loop, no intermediate arrays:
+
+```
+b_{N+1} = 0,  b_{N+2} = 0
+b_k = 2t · b_{k+1} - b_{k+2} + c_k     (for k = N, N-1, ..., 0)
+result = b_0 - t · b_1
+```
+
+In EphCore that's a **tail-recursive** function over pre-reversed coefficients:
+
+```elixir
+# The evaluate_reversed/2 function in action (coefficients are already high→low)
+x = Chebyshev.evaluate_reversed(cx, t)
+y = Chebyshev.evaluate_reversed(cy, t)
+z = Chebyshev.evaluate_reversed(cz, t)
+
+Kino.Markdown.new("""
+### Evaluated position (km, ICRF)
+
+| Axis | Value |
+|------|-------|
+| X | `#{Float.round(x, 6)}` |
+| Y | `#{Float.round(y, 6)}` |
+| Z | `#{Float.round(z, 6)}` |
+| Coefficients per axis | `#{length(cx)}` (degree #{length(cx) - 1}) |
+""")
+```
+
+### Toy example: a hand-made curve
+
+Forget planets for a second. A 4-number payload `[2, -3, 0.5, 1]` defines a
+smooth function on [-1, 1]. Same API we'll use for Mars — just smaller.
+
+```elixir
+coeffs = [2.0, -3.0, 0.5, 1.0]
+
+points =
+  for i <- 0..100 do
+    t_val = -1.0 + i * 0.02
+    %{t: t_val, f: Chebyshev.evaluate(coeffs, t_val)}
+  end
+
+Vl.new(width: 520, height: 260, title: "Toy Chebyshev series: 2T₀ − 3T₁ + 0.5T₂ + T₃")
+|> Vl.data_from_values(points)
+|> Vl.mark(:line, color: "#6366f1")
+|> Vl.encode_field(:x, "t", type: :quantitative, title: "t ∈ [-1, 1]")
+|> Vl.encode_field(:y, "f", type: :quantitative, title: "f(t)")
+```
+
+### Visualize Mars X-coefficient magnitudes
+
+Higher-degree terms get tiny fast — that's why a short coefficient list still
+hits sub-km accuracy over a multi-day window. Same reason JPEG can drop high
+frequencies: most of the signal lives in the early terms.
+
+```elixir
+# cx is pre-reversed (high→low), so reverse back to get natural order
+cx_natural = Enum.reverse(cx)
+
+coeff_data =
+  cx_natural
+  |> Enum.with_index()
+  |> Enum.map(fn {c, i} -> %{degree: i, magnitude: abs(c), log_mag: :math.log10(max(abs(c), 1.0e-30))} end)
+
+Vl.new(width: 520, height: 260, title: "Mars X-axis Chebyshev coefficient magnitudes (log₁₀)")
+|> Vl.data_from_values(coeff_data)
+|> Vl.mark(:bar, color: "#f59e0b")
+|> Vl.encode_field(:x, "degree", type: :ordinal, title: "Degree k")
+|> Vl.encode_field(:y, "log_mag", type: :quantitative, title: "log₁₀|cₖ|")
+```
+
+## 6 — Raw Mars query end-to-end
+
+Wire it together: wall-clock UTC → internal time scales → seconds past J2000 →
+`SPK.position_at` (the shard → payload → curve path from §4).
+
+```elixir
+# Full manual pipeline
+utc_now = ~U[2026-07-21 17:00:00Z]
+tt_now = TerrestrialTime.from_utc(utc_now)
+jd_tt_now = JulianDay.from_datetime(tt_now)
+j2000 = 2_451_545.0
+secs = (jd_tt_now - j2000) * 86_400.0
+
+{us, {:ok, pos}} = :timer.tc(fn -> SPK.position_at(4, 0, secs) end)
+
+{x, y, z} = pos
+range = :math.sqrt(x * x + y * y + z * z)
+
+Kino.Markdown.new("""
+### `SPK.position_at(4, 0, #{Float.round(secs, 1)})` — Mars SSB
+
+| | Value |
+|--|-------|
+| X | `#{Float.round(x, 3)}` km |
+| Y | `#{Float.round(y, 3)}` km |
+| Z | `#{Float.round(z, 3)}` km |
+| Range from SSB | `#{Float.round(range, 3)}` km |
+| Query time | **#{us} µs** |
+
+*Compare: the geocentric state above subtracts Earth's position, giving a
+different vector and range. This cell is the raw "from solar-system origin"
+position.*
+""")
+```
+
+### Benchmark: 10 000 queries
+
+Tip: in Livebook, convert this subsection's parent section to a **branching
+section** if you want to skip the bench during dry-runs.
+
+```elixir
+epochs = for i <- 0..9999, do: secs + i * 86_400.0 / 10
+
+{bench_us, _} =
+  :timer.tc(fn ->
+    Enum.each(epochs, fn e -> SPK.position_at_fast(4, 0, e) end)
+  end)
+
+Kino.Markdown.new("""
+**10 000 queries** in #{Float.round(bench_us / 1000, 1)} ms
+→ **#{Float.round(bench_us / 10_000, 2)} µs/query** (ETS lookup + curve eval, no telemetry)
+""")
+```
+
+## 7 — Type 21 / Difference Arrays (asteroids)
+
+Same container format (SPK/DAF), **different codec** for the curve payload.
+
+* Planets in DE440s use **Type 2** — fixed-length Chebyshev windows (what we
+  walked through above).
+* Asteroids from Horizons (e.g. `2000001.bsp` for Ceres) use **Type 21** —
+  difference-array records (a different interpolation scheme from SPICELIB).
+
+Think JPEG vs PNG: same "image file" idea, different bytes on disk, different
+decoder. The public API still answers "where is this body at time T?"
+
+```mermaid
+graph TD
+    subgraph planets["Type 2 - planets"]
+        A[Fixed-length curve windows] --> B["Clenshaw - linear in N"]
+    end
+    subgraph asteroids["Type 21 - asteroids"]
+        C[Variable-order difference records] --> D[Difference-array decoder]
+        D --> E[Position and velocity]
+    end
+```
+
+**Key differences:**
+
+|             | Type 2 (planets)           | Type 21 (asteroids)          |
+| ----------- | -------------------------- | ---------------------------- |
+| Source      | JPL DE series              | JPL Horizons                 |
+| Bodies      | Planets, Sun, Moon         | Small bodies                 |
+| Decoder     | Clenshaw over coefficients | Difference-array walk        |
+| Storage     | Fixed coeffs per axis      | Difference table + stepsizes |
+| Our modules | `Type2` + `Chebyshev`      | `Type21` + `DifferenceArray` |
+
+`DifferenceArray` is a pure-Elixir port of the Fortran decoder. Asteroid
+kernels live under `priv/ephemeris/spk/asteroids/` — not loaded here to keep
+this notebook light.
+
+```elixir
+# Show which data types are present in our loaded segments
+segments
+|> Enum.frequencies_by(& &1.data_type)
+|> Enum.map(fn {type, count} ->
+  label = case type do
+    2 -> "Type 2 (Chebyshev)"
+    21 -> "Type 21 (MDA)"
+    other -> "Type #{other}"
+  end
+  %{data_type: type, label: label, segment_count: count}
+end)
+|> Kino.DataTable.new(name: "Loaded segment types")
+```
+
+## 8 — Why Elixir? (talk beats)
+
+```mermaid
+mindmap
+  root((EphCore))
+    Binary matching
+      Unpack floats in Elixir
+      No memcpy, no NIF
+      DAF header in a few lines
+    ETS read concurrency
+      Named public table
+      Concurrent reads scale
+      Thousands of queries per ms
+    Pre-reversed coefficients
+      Reverse once at load
+      Skip reverse on hot path
+      About 15 percent faster
+    Fast curve eval
+      Linear cost per axis
+      Tail recursive loop
+      No temp basis arrays
+    No GIL
+      Fan-out with Task.async_stream
+      Scales across cores
+      Full-year almanac fan-out
+```
+
+### Summary of the architecture
+
+Same three-step metaphor, with BEAM-shaped implementation details:
+
+1. **Load time (warm the cache)** — Parse the binary index, then stuff every
+   window's curve numbers into ETS. Reverse coefficients once so queries stay
+   cheap.
+
+2. **Query time (shard → payload → curve)** — One ETS read for metadata, integer
+   math to pick the window, one ETS read for coefficients, normalize time,
+   evaluate. Two lookups + arithmetic. That's it.
+
+3. **Concurrency** — ETS with `read_concurrency: true` is shared memory without
+   a mutex tax on readers. An almanac job can `Task.async_stream` 365 days × 10
+   bodies across cores with no SPK coordination layer.
+
+4. **No GIL, no FFI** — The decoder and evaluator are plain Elixir on the BEAM.
+   Boot opens the file; after that it's process-local work. Deploy with
+   `mix release` — no native toolchain, no linked astronomy library.
+
+---
+
+**End of tour.** Next steps:
+
+* Swap `de440s.bsp` for `de440.bsp` (full precision, 1550–2650 CE coverage)
+* Load asteroid kernels and query Type 21 segments
+* See [`getting_started.livemd`](../getting_started.livemd) for topocentric sky and multi-city fan-out
+* Compare positions against Skyfield via [`02_skyfield_snapshot.livemd`](../02_applications/02_skyfield_snapshot.livemd)

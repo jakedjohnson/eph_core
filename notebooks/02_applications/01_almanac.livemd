@@ -1,0 +1,266 @@
+# EphCore.Events.Almanac — Public Surface Tour
+
+```elixir
+Mix.install(
+  [
+    {:eph_core, path: Path.expand("../..", __DIR__)},
+    {:kino, "~> 0.14"}
+  ],
+  config: [
+    eph_core: [
+      # Planetary DE440s only. Avoid config_path: :eph_core here — that loads
+      # config.exs asteroid kernels before SPK.Server starts.
+      kernel_base_dir: Path.expand("../../priv", __DIR__),
+      spk_kernels: ["de440s.bsp"]
+    ]
+  ]
+)
+
+Logger.configure(level: :warning)
+```
+
+## Overview
+
+Full-year rise / transit / set almanac via `EphCore.Events.Almanac`.
+
+**Maturity:** Experimental public surface. Accuracy is typically within ~1 second of
+Skyfield's `almanac()` output for the same observer and body set. The implementation
+uses `ApparentPlace` + analytic Meeus seeds and bracketed root-finding — it does *not*
+wrap `SnapshotPipeline`.
+
+Sun + Moon for one year finishes in seconds on a modern laptop. The classic-7 cell
+is optional — skip it during a quick dry-run.
+
+**How to open:** Install [Livebook](https://livebook.dev/), open this `.livemd`,
+evaluate the setup cell.
+
+## Helpers
+
+```elixir
+alias EphCore.Events.Almanac
+
+# Rise/set omit :alt_deg; transit includes it. Kino.DataTable needs uniform columns.
+event_rows = fn events ->
+  Enum.map(events, fn e ->
+    %{
+      body: e.body,
+      event: e.event,
+      utc: e.utc,
+      tt_jd: e.tt_jd,
+      az_deg: Map.get(e, :az_deg),
+      alt_deg: Map.get(e, :alt_deg)
+    }
+  end)
+end
+
+:ok
+```
+
+## Ready check
+
+```elixir
+priv = EphCore.Ephemeris.Kernels.base_dir()
+spk = Path.join([priv, "ephemeris", "spk", "de440s.bsp"])
+
+Kino.Markdown.new("""
+**EphCore** `#{Application.spec(:eph_core, :vsn)}` · priv `#{priv}`
+
+SPK `de440s.bsp`: #{if File.exists?(spk), do: "✅ present", else: "❌ missing — run `mix eph.download_kernels`"}
+
+Schedulers online: **#{System.schedulers_online()}**
+""")
+```
+
+## Presets & Chicago helper
+
+The almanac ships three body presets and a canonical Chicago observer helper.
+
+```elixir
+Kino.Markdown.new("""
+**Presets**
+
+    #{inspect(Almanac.presets(), pretty: true) |> String.replace("\n", "\n    ")}
+
+**classic7:** `#{inspect(Almanac.preset(:classic7))}`
+
+**chicago/0:** `#{inspect(Almanac.chicago())}`
+""")
+```
+
+## LIGHT demo — Sun + Moon, Minneapolis, 2026
+
+Two bodies × 365 days. This fans out over all your BEAM schedulers via
+`Task.async_stream` — each day is independent (its own noon frame + analytic
+seeds + bracketed refinement), so the work distributes cleanly.
+
+```elixir
+minneapolis = %{lat: 44.9778, lon: -93.2650, height: 250.0}
+
+{us, result} =
+  :timer.tc(fn ->
+    Almanac.generate(
+      year: 2026,
+      observer: minneapolis,
+      bodies: [:sun, :moon]
+    )
+  end)
+
+Kino.Markdown.new("""
+**#{result.meta.event_count} events** (sun + moon, #{result.meta.year}) \
+in **#{Float.round(us / 1_000_000, 2)} s** \
+on #{System.schedulers_online()} schedulers.
+
+Observer: `#{result.meta.location.latitude_deg}°, #{result.meta.location.longitude_deg}°` \
+(#{result.meta.location.elevation_m} m)
+
+Engine: `#{result.meta.engine}` · Kernel: `#{result.meta.kernel}` · \
+Horizon: `#{result.meta.horizon_convention}`
+""")
+```
+
+### Meta map
+
+```elixir
+result.meta
+```
+
+### First 20 events
+
+```elixir
+result.events
+|> Enum.take(20)
+|> then(event_rows)
+|> Kino.DataTable.new(name: "First 20 rise/transit/set events")
+```
+
+## Event shape
+
+Each event is a flat map. Rise and set events carry `az_deg` (azimuth at the
+horizon crossing); transit events also carry `alt_deg` (culmination altitude).
+Missing keys are real — `event_rows/1` (helpers cell) pads them to `nil` so
+`Kino.DataTable` gets uniform columns. The `utc` string is truncated to seconds;
+`tt_jd` is the precise Terrestrial-Time Julian date used internally.
+
+```elixir
+rise = Enum.find(result.events, &(&1.event == "rise"))
+transit = Enum.find(result.events, &(&1.event == "transit"))
+set = Enum.find(result.events, &(&1.event == "set"))
+
+[rise, transit, set]
+|> then(event_rows)
+|> Kino.DataTable.new(name: "One rise / transit / set triple")
+```
+
+| Field     | Type   | Present on   | Notes                                 |
+| --------- | ------ | ------------ | ------------------------------------- |
+| `body`    | string | all          | `"sun"`, `"moon"`, `"mars"`, …      |
+| `event`   | string | all          | `"rise"` / `"transit"` / `"set"`      |
+| `utc`     | string | all          | ISO 8601, second-truncated            |
+| `tt_jd`   | float  | all          | TT Julian date — internal precision |
+| `az_deg`  | float  | all          | Azimuth at event (°)                 |
+| `alt_deg` | float  | transit only | Culmination altitude (°)             |
+
+## CPU — skip in dry-run
+
+Classic-7 bodies (Sun, Moon, Mercury, Venus, Mars, Jupiter, Saturn) for a full
+year. Expect 10–30 s depending on your machine. This exercises the full BEAM
+fan-out story: 365 days × 7 bodies, each day independent, no serialization on
+any process — the shared SPK ETS table is read-concurrent.
+
+Tip: in Livebook, convert this section to a **branching section** so it does not
+block evaluating the rest of the notebook.
+
+```elixir
+{heavy_us, heavy} =
+  :timer.tc(fn ->
+    Almanac.generate(
+      year: 2026,
+      observer: minneapolis,
+      bodies: Almanac.preset(:classic7)
+    )
+  end)
+
+Kino.Markdown.new("""
+**#{heavy.meta.event_count} events** (classic7, #{heavy.meta.year}) \
+in **#{Float.round(heavy_us / 1_000_000, 2)} s** \
+on #{System.schedulers_online()} schedulers.
+
+Bodies: #{Enum.join(heavy.meta.bodies, ", ")}
+""")
+```
+
+```elixir
+heavy.events
+|> Enum.take(30)
+|> then(event_rows)
+|> Kino.DataTable.new(name: "Classic-7 — first 30 events")
+```
+
+## Concurrency notes
+
+The almanac is embarrassingly parallel by UTC day: each day computes one noon
+`ApparentPlace.frame`, runs the Meeus seed formula per body, brackets and
+refines each crossing independently. `Task.async_stream` fans out over
+`System.schedulers_online()` — on an 8-core laptop that is 8× throughput with
+zero shared mutable state.
+
+### What happens inside `events/4`
+
+```
+365 UTC days
+  └─ Task.async_stream (max_concurrency: schedulers_online)
+       └─ per day:
+            1. ApparentPlace.frame(noon)          ← nutation, Earth velocity
+            2. for body <- bodies:
+                 ApparentPlace.look(noon_frame, body) ← RA/Dec
+                 Meeus cos H₀ → analytic rise/transit/set seeds
+                 bracket ±40 min, confirm sign change
+                 solve_bracket → ≤ 250 µs tolerance
+            3. collect events
+  └─ dedupe_close_events → sort by tt_jd
+```
+
+The SPK kernel lives in a read-only ETS table — no GenServer, no serialization.
+Each task does its own floating-point work on its own scheduler.
+
+### Accuracy vs Skyfield
+
+The target is **≤ 1 second** against Skyfield's `almanac()` for the same
+observer, year, and body set. The analytic-seed approach replaces a dense
+1-hour altitude grid (8 760 frames for the coarse sweep) with ~365 noon frames +
+~10 evaluations per event — far cheaper while staying inside the accuracy
+contract.
+
+| Metric             | EphCore Almanac                | Skyfield `almanac()`  |
+| ------------------ | ------------------------------ | --------------------- |
+| Frame model        | IAU 2006/2000A (ApparentPlace) | IAU 2006/2000A        |
+| Horizon convention | USNO thresholds                | USNO thresholds       |
+| Accuracy target    | ≤ 1 s                        | reference             |
+| Coarse grid        | analytic seeds (none)          | altitude every ~1 min |
+| Concurrency        | `Task.async_stream`            | single-threaded NumPy |
+| Language           | Elixir / BEAM                  | Python / C            |
+
+## Key ideas
+
+1. **One function, one year** — `Almanac.generate/1` returns rise/transit/set
+   events for every day in the requested year.
+
+2. **Analytic seeds** — Meeus hour-angle formula gives a ~minute-accurate first
+   guess. Bracket ±40 min, confirm sign change, refine with inverse interpolation
+   to 250 µs. No dense grid.
+
+3. **BEAM fan-out** — each UTC day is independent; `Task.async_stream` scales
+   with `System.schedulers_online()`.
+
+4. **Cross-check** — compare against Skyfield via
+   [`02_skyfield_snapshot.livemd`](02_skyfield_snapshot.livemd) or run
+   `mix eph.snapshot_sanity_check` in dev.
+
+## Next steps
+
+* Try `:modern10` for outer-planet edge cases (circumpolar / never-rises at
+  extreme latitudes).
+* Swap Minneapolis for Reykjavík (`64.15°N`) — watch the midnight sun produce
+  no rise/set events for the Sun in June.
+* See [`getting_started.livemd`](../getting_started.livemd) for single-instant
+  `observe/4` and multi-city fan-out.

@@ -1,0 +1,328 @@
+# EphCore.Corrections.ApparentPlace — Light-Time & Aberration
+
+```elixir
+Mix.install(
+  [
+    {:eph_core, path: Path.expand("../..", __DIR__)},
+    {:kino, "~> 0.14"},
+    {:kino_vega_lite, "~> 0.1"}
+  ],
+  config: [
+    eph_core: [
+      # Planetary DE440s only. Avoid config_path: :eph_core here — that loads
+      # config.exs asteroid kernels before SPK.Server starts.
+      kernel_base_dir: Path.expand("../../priv", __DIR__),
+      spk_kernels: ["de440s.bsp"]
+    ]
+  ]
+)
+
+Logger.configure(level: :warning)
+```
+
+## Overview
+
+Where a planet *is* and where you *see* it are two different places. The
+snapshot pipeline's default output is the **geometric** (astrometric) position —
+the true instantaneous geometry. `EphCore.Corrections.ApparentPlace` adds the
+two effects that turn geometry into **apparent place**, the position an observer
+actually measures and that published almanacs quote:
+
+1. **Light-time retardation** — you see the body where it *was* when the light
+   left it, `τ = range / c` ago. The module iterates the retarded epoch
+   `jd_tt − τ` (two rounds converge well inside a second).
+2. **Annual aberration** — Earth's ~30 km/s orbital motion tilts every incoming
+   ray toward the direction of travel by up to the aberration constant,
+   `κ = |v| / c ≈ 20.5″`. The port uses Skyfield's exact relativistic
+   `add_aberration` formula so the two engines agree.
+
+This is the backbone of the 1-second-accurate almanac (`../02_applications/01_almanac.livemd`).
+
+**Usage shape:** build a per-timestamp `frame/2` once (Earth state, velocity,
+nutation, observer geometry), then call `look/2` or `apparent_lon_lat/2` per body.
+
+**How to open:** Install [Livebook](https://livebook.dev/), open this `.livemd`,
+evaluate the setup cell. Kernels must be under `eph_core/priv/ephemeris/`.
+
+## Helpers
+
+```elixir
+alias VegaLite, as: Vl
+alias EphCore.Corrections.ApparentPlace
+alias EphCore.Ephemeris
+alias EphCore.Geometry.Ecliptic
+alias EphCore.SnapshotPipeline
+alias AstroUtils.{Angle, Vector}
+
+read_utc = fn input ->
+  case Kino.Input.read(input) do
+    %DateTime{} = dt -> DateTime.truncate(dt, :second)
+    %NaiveDateTime{} = ndt -> ndt |> DateTime.from_naive!("Etc/UTC") |> DateTime.truncate(:second)
+  end
+end
+
+arcsec = fn deg -> deg * 3600.0 end
+:ok
+```
+
+## Ready check
+
+```elixir
+Kino.Markdown.new("""
+**EphCore** `#{Application.spec(:eph_core, :vsn)}` loaded.
+
+Speed of light used by the pass: **#{Float.round(ApparentPlace.c_km_per_day() / 86_400.0, 3)} km/s**
+(#{ApparentPlace.c_km_per_day()} km/day).
+""")
+```
+
+## 1 — Observer & instant → the frame
+
+`frame/2` does all the per-timestamp work once. Everything below reuses it.
+
+```elixir
+lat_in = Kino.Input.number("Latitude (°)", default: 44.9778)
+lon_in = Kino.Input.number("Longitude (°)", default: -93.2650)
+height_in = Kino.Input.number("Height (m)", default: 250)
+utc_in = Kino.Input.utc_datetime("UTC", default: ~N[2026-07-21 04:00:00])
+
+Kino.Layout.grid([lat_in, lon_in, height_in, utc_in], columns: 2)
+```
+
+```elixir
+observer = %{
+  lat: Kino.Input.read(lat_in),
+  lon: Kino.Input.read(lon_in),
+  height: Kino.Input.read(height_in)
+}
+
+utc = read_utc.(utc_in)
+frame = ApparentPlace.frame(utc, observer)
+
+v_mag = Vector.magnitude(frame.earth_velocity_km_per_day)
+# Aberration constant κ = |v|/c, expressed in arcseconds.
+kappa_arcsec = v_mag / ApparentPlace.c_km_per_day() * Angle.rad_to_deg(1.0) * 3600.0
+
+Kino.Markdown.new("""
+| Frame field | Value |
+|-------------|-------|
+| JD(TT) | #{Float.round(frame.jd_tt, 6)} |
+| LAST (local apparent sidereal time) | #{Float.round(frame.last_deg, 4)}° |
+| Earth barycentric speed | #{Float.round(v_mag / 86_400.0, 3)} km/s |
+| Aberration constant κ = speed ÷ c | **#{Float.round(kappa_arcsec, 2)}″** |
+
+The classical aberration constant is ~20.5″; Earth's speed varies slightly over
+the year (perihelion in January), so κ breathes with it.
+""")
+```
+
+## 2 — Geometric vs apparent, per body
+
+For each body we compute the **geometric** geocentric ecliptic position (straight
+from the ephemeris) and the **apparent** geocentric position (light-time +
+aberration), then measure the angular separation.
+
+```elixir
+bodies = [:mercury, :venus, :mars, :jupiter, :saturn, :uranus, :neptune, :moon]
+
+geo_vs_app =
+  for body <- bodies do
+    # Geometric: raw geocentric vector → true-of-date ecliptic lon/lat.
+    {:ok, state} = Ephemeris.geocentric_state(frame.jd_tt, body)
+    {geo_lon, geo_lat} = Ecliptic.icrf_to_true_lon_lat(state.geocentric_position_km, frame.jd_tt)
+
+    # Apparent geocentric: light-time + aberration.
+    %{geocentric: {app_lon, app_lat}} = ApparentPlace.apparent_lon_lat(frame, body)
+
+    dlon = Angle.signed_delta(geo_lon, app_lon)
+    dlat = app_lat - geo_lat
+    total = :math.sqrt(dlon * dlon * :math.pow(:math.cos(Angle.deg_to_rad(geo_lat)), 2) + dlat * dlat)
+
+    light_min = state.geocentric_range_km / (ApparentPlace.c_km_per_day() / 86_400.0) / 60.0
+
+    %{
+      body: body,
+      range_Mkm: Float.round(state.geocentric_range_km / 1_000_000, 2),
+      light_time_min: Float.round(light_min, 2),
+      geometric_lon: Float.round(geo_lon, 5),
+      apparent_lon: Float.round(app_lon, 5),
+      shift_arcsec: Float.round(arcsec.(total), 2)
+    }
+  end
+
+Kino.DataTable.new(geo_vs_app, name: "Geometric vs apparent geocentric")
+```
+
+```elixir
+Vl.new(width: 560, height: 300, title: "Total geometric→apparent shift (arcsec)")
+|> Vl.data_from_values(geo_vs_app)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "body", type: :nominal, sort: Enum.map(geo_vs_app, &to_string(&1.body)))
+|> Vl.encode_field(:y, "shift_arcsec", type: :quantitative, title: "Shift (″)")
+|> Vl.encode_field(:color, "light_time_min", type: :quantitative,
+  scale: [scheme: "magma"], title: "Light time (min)")
+```
+
+Notice the shift clusters near the ~20″ aberration constant for most bodies —
+aberration dominates. Fast, nearby bodies (the Moon, inner planets) add a
+larger light-time term on top, because they move appreciably during the delay.
+
+## 3 — Anatomy: light-time delay
+
+Light-time is pure geometry: `τ = range / c`. Sunlight-on-a-planet takes minutes
+to hours to reach us; over that delay a fast body slides measurably along its path.
+
+```elixir
+lt_rows =
+  for body <- [:moon, :mars, :jupiter, :saturn, :neptune] do
+    {:ok, state} = Ephemeris.geocentric_state(frame.jd_tt, body)
+    c_km_s = ApparentPlace.c_km_per_day() / 86_400.0
+    tau_s = state.geocentric_range_km / c_km_s
+
+    %{
+      body: body,
+      range_Mkm: Float.round(state.geocentric_range_km / 1_000_000, 2),
+      light_time: cond do
+        tau_s < 90 -> "#{Float.round(tau_s, 1)} s"
+        tau_s < 5400 -> "#{Float.round(tau_s / 60, 2)} min"
+        true -> "#{Float.round(tau_s / 3600, 2)} h"
+      end
+    }
+  end
+
+Kino.DataTable.new(lt_rows, name: "Light-time delay by body")
+```
+
+## 4 — Anatomy: aberration direction
+
+Aberration always tilts the apparent position **toward** the point Earth is
+racing toward (the apex of its orbital motion). We can see this by comparing the
+apparent shift's direction to Earth's velocity vector projected onto the sky.
+
+```elixir
+# Earth's velocity direction in ecliptic longitude (the "apex" of motion).
+{vx, vy, vz} = frame.earth_velocity_km_per_day
+{apex_lon, apex_lat} = Ecliptic.icrf_to_true_lon_lat({vx, vy, vz}, frame.jd_tt)
+
+Kino.Markdown.new("""
+**Apex of Earth's motion** (where aberration points, in true-of-date ecliptic):
+
+* longitude **#{Float.round(apex_lon, 2)}°**, latitude **#{Float.round(apex_lat, 2)}°**
+* magnitude of the tilt at the apex ≈ κ = **#{Float.round(v_mag / ApparentPlace.c_km_per_day() * Angle.rad_to_deg(1.0) * 3600.0, 2)}″**
+
+A body 90° from the apex gets the full κ tilt; a body toward or away from the
+apex is displaced radially (foreshortened), not sideways.
+""")
+```
+
+## 5 — Topocentric parallax: the Moon steals the show
+
+`apparent_lon_lat/2` returns both the **geocentric** apparent place and the
+**topocentric** one (observer position subtracted). The gap is diurnal parallax
+— tiny for planets, but nearly a degree for the Moon.
+
+```elixir
+parallax_rows =
+  for body <- [:moon, :venus, :mars, :jupiter, :saturn] do
+    %{geocentric: {glon, glat}, topocentric: {tlon, tlat}} =
+      ApparentPlace.apparent_lon_lat(frame, body)
+
+    dlon = Angle.signed_delta(glon, tlon)
+    dlat = tlat - glat
+    sep = :math.sqrt(dlon * dlon + dlat * dlat)
+
+    %{
+      body: body,
+      geocentric_lon: Float.round(glon, 5),
+      topocentric_lon: Float.round(tlon, 5),
+      parallax_arcsec: Float.round(arcsec.(sep), 1)
+    }
+  end
+
+Kino.DataTable.new(parallax_rows, name: "Geocentric vs topocentric (diurnal parallax)")
+```
+
+The Moon's parallax runs to thousands of arcseconds (up to ~1°) — which is why
+lunar rise/set times are meaningfully observer-dependent.
+
+## 6 — Apparent look angles (alt/az/HA/dec)
+
+`look/2` returns the fully-corrected topocentric horizon coordinates — the same
+values the almanac's rise/set/transit solver brackets.
+
+```elixir
+look_rows =
+  for body <- [:sun, :moon, :mercury, :venus, :mars, :jupiter, :saturn] do
+    l = ApparentPlace.look(frame, body)
+
+    %{
+      body: body,
+      altitude_deg: Float.round(l.alt_deg, 3),
+      azimuth_deg: Float.round(l.az_deg, 3),
+      hour_angle_deg: Float.round(l.hour_angle_deg, 3),
+      declination_deg: Float.round(l.declination_deg, 3),
+      range_Mkm: Float.round(l.range_km / 1_000_000, 3)
+    }
+  end
+
+Kino.DataTable.new(look_rows, name: "Apparent topocentric look angles")
+```
+
+## 7 — Cross-check against the snapshot pipeline
+
+The pipeline can produce apparent geocentric longitude directly via correction
+flags. Our `ApparentPlace` output should match it to well under an arcsecond.
+
+```elixir
+check_rows =
+  for body <- [:mars, :jupiter, :saturn, :neptune] do
+    {:ok, o} =
+      SnapshotPipeline.observe(utc, observer, [body],
+        corrections: %{light_time: true, aberration: true}
+      )
+
+    pipeline_lon = o.solar_system_positions[body].apparent_geocentric_ecliptic_longitude
+    %{geocentric: {app_lon, _}} = ApparentPlace.apparent_lon_lat(frame, body)
+
+    %{
+      body: body,
+      apparent_place_lon: Float.round(app_lon, 8),
+      pipeline_lon: Float.round(pipeline_lon, 8),
+      diff_arcsec: Float.round(arcsec.(abs(Angle.signed_delta(app_lon, pipeline_lon))), 5)
+    }
+  end
+
+Kino.DataTable.new(check_rows, name: "ApparentPlace vs SnapshotPipeline")
+```
+
+## Pitfalls & notes
+
+1. **Geometric is the pipeline default** — `observe/4` returns astrometric
+   positions unless you pass `corrections: %{light_time: true, aberration: true}`.
+   Apparent place is opt-in.
+
+2. **Gravitational light deflection is omitted** — it's < 0.05″ except grazing
+   the Sun's limb, so `ApparentPlace` drops it. That's the only term separating
+   this from a full relativistic reduction.
+
+3. **The diurnal aberration term (~0.3″) is dropped** — only Earth's *orbital*
+   (annual) velocity is used. For planets this is negligible; for the strictest
+   stellar work it isn't.
+
+4. **`frame/2` is the reuse unit** — building it re-sums the 106-term IAU 2000A
+   nutation and re-queries Earth's state. Pass `:nutation` / `:earth_velocity`
+   to reuse them across a tight time bracket (the almanac's hot-path trick).
+
+5. **Near a station, arcseconds become hours** — a few arcseconds of apparent
+   longitude offset maps to hours of event-timing error when a planet is nearly
+   stationary. See `../02_applications/04_retrograde_stations.livemd`.
+
+## Key ideas
+
+* **You never see *now*** — light-time means every planet in the sky is a little
+  bit in the past; Neptune is a four-hour-old photograph.
+* **Earth's speed bends the sky ~20″** — aberration is the same effect as rain
+  slanting on a moving car's windshield, scaled to `v/c` and the whole sky.
+* **Compute once, look many** — `frame/2` amortizes the expensive per-instant work
+  so `look/2` per body is cheap. This is why the almanac can afford a
+  Skyfield-grade reduction at every root-finding step.

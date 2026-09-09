@@ -1,0 +1,274 @@
+# EphCore.TopocentricMotion — Retrograde Loops & Stations
+
+```elixir
+Mix.install(
+  [
+    {:eph_core, path: Path.expand("../..", __DIR__)},
+    {:kino, "~> 0.14"},
+    {:kino_vega_lite, "~> 0.1"}
+  ],
+  config: [
+    eph_core: [
+      # Planetary DE440s only. Avoid config_path: :eph_core here — that loads
+      # config.exs asteroid kernels before SPK.Server starts.
+      kernel_base_dir: Path.expand("../../priv", __DIR__),
+      spk_kernels: ["de440s.bsp"]
+    ]
+  ]
+)
+
+Logger.configure(level: :warning)
+```
+
+## Overview
+
+A planet's eastward march along the ecliptic occasionally slows, stops, and
+reverses — **retrograde motion** — an illusion born of Earth overtaking (or
+being overtaken by) another world. The instants where the apparent longitude
+rate crosses zero are the **stations** (retrograde station and direct station).
+
+This tour uses two pieces of the engine:
+
+* `SnapshotPipeline.observe/4` — its `motion` map already reports each body's
+  geocentric `ecliptic_lon_rate_deg_per_day` and a `retrograde` flag.
+* `EphCore.TopocentricMotion` — `ecliptic_lon_rates/4` recomputes the rate in the
+  **observer-topocentric** frame (central difference on `observe/4` longitudes),
+  and `augment/5` merges that back onto a geocentric motion map. This is the
+  frame used to refine station times (rate zero-crossings).
+
+Retrograde is pure parallax geometry — and the rate curve makes the illusion quantitative.
+
+**How to open:** Install [Livebook](https://livebook.dev/), open this `.livemd`,
+evaluate the setup cell. Kernels must be under `eph_core/priv/ephemeris/`. The
+default window catches **Mars's 2024–2025 retrograde**.
+
+## Helpers
+
+```elixir
+alias VegaLite, as: Vl
+alias EphCore.SnapshotPipeline
+alias EphCore.TopocentricMotion
+alias AstroUtils.Angle
+
+:ok
+```
+
+## Ready check
+
+```elixir
+Kino.Markdown.new("""
+**EphCore** `#{Application.spec(:eph_core, :vsn)}` loaded. Ready to scan.
+""")
+```
+
+## Body & window
+
+```elixir
+body_in =
+  Kino.Input.select(
+    "Body",
+    for(b <- [:mars, :mercury, :venus, :jupiter, :saturn], do: {b, b})
+  )
+
+start_in = Kino.Input.text("Start date (UTC)", default: "2024-11-01")
+end_in = Kino.Input.text("End date (UTC)", default: "2025-04-01")
+step_in = Kino.Input.number("Step (days)", default: 2)
+
+Kino.Layout.grid([body_in, start_in, end_in, step_in], columns: 2)
+```
+
+```elixir
+body = Kino.Input.read(body_in)
+start_date = Date.from_iso8601!(String.trim(Kino.Input.read(start_in)))
+end_date = Date.from_iso8601!(String.trim(Kino.Input.read(end_in)))
+step_days = trunc(Kino.Input.read(step_in))
+
+# Minneapolis observer; retrograde is a geocentric phenomenon so location barely matters.
+location = %{lat: 44.9778, lon: -93.2650, height: 250.0}
+
+{:ok, start_dt, _} = DateTime.from_iso8601(Date.to_iso8601(start_date) <> "T06:00:00Z")
+{:ok, end_dt, _} = DateTime.from_iso8601(Date.to_iso8601(end_date) <> "T06:00:00Z")
+
+total_days = DateTime.diff(end_dt, start_dt, :second) |> div(86_400)
+sample_dts = for d <- 0..total_days//step_days, do: DateTime.add(start_dt, d * 86_400, :second)
+
+Kino.Markdown.new("Scanning **#{body}** across **#{length(sample_dts)}** samples (#{start_date} → #{end_date}, every #{step_days} d).")
+```
+
+## 1 — Scan the longitude & rate curves
+
+Fan the samples out across cores with `Task.async_stream`. Each sample reads the
+geocentric ecliptic longitude, latitude, and the pipeline's own rate + retrograde
+flag.
+
+```elixir
+{scan_us, scan} =
+  :timer.tc(fn ->
+    sample_dts
+    |> Task.async_stream(
+      fn dt ->
+        {:ok, obs} = SnapshotPipeline.observe(dt, location, [body])
+        ssp = obs.solar_system_positions[body]
+        motion = obs.motion[body]
+
+        %{
+          date: DateTime.to_date(dt) |> Date.to_iso8601(),
+          dt: dt,
+          lon_deg: ssp.ecliptic_longitude,
+          lat_deg: ssp.ecliptic_latitude,
+          rate_deg_day: motion.ecliptic_lon_rate_deg_per_day,
+          retrograde: motion.retrograde
+        }
+      end,
+      ordered: true,
+      timeout: 60_000
+    )
+    |> Enum.map(fn {:ok, row} -> row end)
+  end)
+
+Kino.render(Kino.Markdown.new("Scanned in **#{Float.round(scan_us / 1000, 1)} ms**."))
+
+table_rows =
+  Enum.map(scan, fn r ->
+    %{
+      date: r.date,
+      lon_deg: Float.round(r.lon_deg, 4),
+      lat_deg: Float.round(r.lat_deg, 4),
+      rate_deg_day: Float.round(r.rate_deg_day, 5),
+      retrograde: r.retrograde
+    }
+  end)
+
+Kino.DataTable.new(table_rows, name: "#{body} longitude & rate scan")
+```
+
+```elixir
+Vl.new(width: 620, height: 260, title: "#{body}: ecliptic longitude rate (deg/day)")
+|> Vl.data_from_values(table_rows)
+|> Vl.layers([
+  Vl.new()
+  |> Vl.mark(:line, point: false)
+  |> Vl.encode_field(:x, "date", type: :temporal, title: nil)
+  |> Vl.encode_field(:y, "rate_deg_day", type: :quantitative, title: "Rate (°/day)")
+  |> Vl.encode_field(:color, "retrograde", type: :nominal, title: "Retrograde?"),
+  # Zero line: the rate crossings are the stations.
+  Vl.new()
+  |> Vl.mark(:rule, color: "black", stroke_dash: [4, 4])
+  |> Vl.encode(:y, datum: 0)
+])
+```
+
+When the rate dips **below zero**, the planet is moving retrograde (westward);
+the zero crossings are the stations.
+
+## 2 — The retrograde loop
+
+Plotting ecliptic longitude against latitude traces the actual **loop** the
+planet appears to draw against the stars — the signature S-curve or teardrop.
+
+```elixir
+Vl.new(width: 460, height: 380, title: "#{body}: apparent path (ecliptic lon vs lat)")
+|> Vl.data_from_values(table_rows)
+|> Vl.mark(:line, point: true)
+|> Vl.encode_field(:x, "lon_deg", type: :quantitative, scale: [zero: false], title: "Ecliptic longitude (°)")
+|> Vl.encode_field(:y, "lat_deg", type: :quantitative, scale: [zero: false], title: "Ecliptic latitude (°)")
+|> Vl.encode_field(:order, "date", type: :temporal)
+|> Vl.encode_field(:color, "retrograde", type: :nominal, title: "Retrograde?")
+```
+
+## 3 — Find the stations (rate sign changes)
+
+Walk consecutive samples; where the sign of the rate flips, linearly interpolate
+the zero crossing to estimate the station instant and the longitude it happens at.
+
+```elixir
+stations =
+  scan
+  |> Enum.chunk_every(2, 1, :discard)
+  |> Enum.flat_map(fn [a, b] ->
+    if a.rate_deg_day == 0.0 or a.rate_deg_day * b.rate_deg_day < 0.0 do
+      # Fraction of the interval where rate hits zero.
+      frac = a.rate_deg_day / (a.rate_deg_day - b.rate_deg_day)
+      secs = DateTime.diff(b.dt, a.dt, :second)
+      station_dt = DateTime.add(a.dt, round(frac * secs), :second)
+      lon = a.lon_deg + frac * Angle.signed_delta(a.lon_deg, b.lon_deg)
+
+      kind = if b.rate_deg_day < 0.0, do: "retrograde station (→ R)", else: "direct station (→ D)"
+      [%{kind: kind, when_utc: DateTime.to_iso8601(station_dt), longitude_deg: Float.round(lon, 3)}]
+    else
+      []
+    end
+  end)
+
+if stations == [] do
+  Kino.Markdown.new("No station found in this window — try a wider range or a body that turns retrograde here (Mars 2024-11 → 2025-04 is a sure hit).")
+else
+  Kino.DataTable.new(stations, name: "#{body} stations in window")
+end
+```
+
+Refinement note: this is a linear interpolation on a coarse grid. A production
+pipeline seeds from exactly this kind of scan, then refines each station to
+sub-minute precision with a bracketed root-find on the topocentric rate.
+
+## 4 — Geocentric vs topocentric rate
+
+`TopocentricMotion.ecliptic_lon_rates/4` recomputes the rate in the observer's
+topocentric frame. Diurnal parallax adds a small wobble versus the geocentric
+rate — negligible for outer planets, but it's the frame the grid actually
+refines in, so the detectors stay self-consistent.
+
+```elixir
+# Sample near the middle of the window for a representative comparison.
+mid_dt = Enum.at(sample_dts, div(length(sample_dts), 2))
+
+topo_rates = TopocentricMotion.ecliptic_lon_rates(mid_dt, location, [body])
+{:ok, mid_obs} = SnapshotPipeline.observe(mid_dt, location, [body])
+geo_rate = mid_obs.motion[body].ecliptic_lon_rate_deg_per_day
+topo_rate = topo_rates[body]
+
+Kino.Markdown.new("""
+At **#{DateTime.to_iso8601(mid_dt)}** for **#{body}**:
+
+| Frame | Rate (°/day) |
+|-------|--------------|
+| Geocentric (pipeline) | #{Float.round(geo_rate, 6)} |
+| Topocentric (central diff) | #{Float.round(topo_rate, 6)} |
+| Difference | #{Float.round((topo_rate - geo_rate) * 3600, 3)} ″/day |
+""")
+```
+
+```elixir
+# augment/5 folds the topocentric rate onto the geocentric motion map.
+augmented = TopocentricMotion.augment(mid_dt, location, [body], mid_obs.motion)
+Kino.DataTable.new([Map.put(augmented[body], :body, body)], name: "Augmented motion map for #{body}")
+```
+
+## Pitfalls & notes
+
+1. **Retrograde is geocentric** — it's a line-of-sight effect from Earth's own
+   motion, so it barely depends on the observer. Topocentric parallax only
+   perturbs the *rate* slightly; it doesn't create or move the loop.
+
+2. **Rate sign is the definition** — `retrograde: true` ⇔ negative ecliptic
+   longitude rate. Stations are the zero crossings, nothing more exotic.
+
+3. **`ecliptic_lon_rates/4` is central difference** — it calls `observe/4` at
+   `datetime ± delta_minutes` (default 30). Very near a station the second
+   derivative matters, so tighten `delta_minutes:` if you refine there.
+
+4. **Coarse grids miss fast bodies** — Mercury's whole retrograde is ~3 weeks;
+   drop the step to 1 day (or less) so you don't skip the stations.
+
+5. **`augment/5` mutates only the rate key** — it adds
+   `:topocentric_ecliptic_lon_rate_deg_per_day` and leaves the rest of each
+   body's geocentric motion map intact.
+
+## Key ideas
+
+* **The planet never stops** — the rate curve dipping through zero is a parallax
+  artifact of Earth's orbit, not celestial mechanics grinding to a halt.
+* **Stations are zero crossings** — retrograde detection reduces to a sign change
+  on one number the pipeline already emits. The loop plot is the payoff.
+* **Coarse scan → refine** — this notebook mirrors a common pattern: coarse
+  `async_stream` scan, then bracket and refine each station.

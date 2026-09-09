@@ -1,0 +1,323 @@
+# EphCore.Stars — Fixed Stars Tour
+
+```elixir
+Mix.install(
+  [
+    {:eph_core, path: Path.expand("../..", __DIR__)},
+    {:kino, "~> 0.14"},
+    {:kino_vega_lite, "~> 0.1"}
+  ],
+  config: [
+    eph_core: [
+      # Planetary DE440s only. Avoid config_path: :eph_core here — that loads
+      # config.exs asteroid kernels before SPK.Server starts.
+      kernel_base_dir: Path.expand("../../priv", __DIR__),
+      spk_kernels: ["de440s.bsp"]
+    ]
+  ]
+)
+
+Logger.configure(level: :warning)
+```
+
+## Overview
+
+The planets move; the "fixed" stars only *seem* to. `EphCore.Stars` loads the
+**Hipparcos** catalog, applies each star's **proper motion** from the J1991.25
+catalog epoch, and projects the result into ecliptic, equatorial-of-date, and
+local horizon coordinates.
+
+Two tiny modules do the work:
+
+* `EphCore.Stars.Catalog` — parses `priv/stars/hip_main.dat` once, caches it in
+  `:persistent_term`, and exposes `lookup/1`, `all_significant/0`, and a curated
+  HIP → traditional-name map (`significance_list/0`).
+* `EphCore.Stars.Position` — `compute/3` takes a star record + `jd_tt` and
+  returns RA/Dec (of date), ecliptic lon/lat, and optional alt/az.
+
+**How to open:** Install [Livebook](https://livebook.dev/), open this `.livemd`,
+evaluate the setup cell. The Hipparcos catalog is **optional** — fixed-star cells
+need `priv/stars/hip_main.dat`. From the repo root:
+
+```bash
+mix eph.setup_stars
+```
+
+That downloads ~51 MB into `priv/stars/`. Planetary ephemeris works without it;
+see `README.md` for manual download if the task fails.
+
+## Helpers
+
+```elixir
+alias VegaLite, as: Vl
+alias EphCore.Stars.{Catalog, Position}
+alias EphCore.Corrections.ApparentPlace
+alias EphCore.SnapshotPipeline
+
+# Kino.Input.utc_datetime/2 reads as NaiveDateTime (UTC) or DateTime depending on version.
+read_utc = fn input ->
+  case Kino.Input.read(input) do
+    %DateTime{} = dt -> DateTime.truncate(dt, :second)
+    %NaiveDateTime{} = ndt -> ndt |> DateTime.from_naive!("Etc/UTC") |> DateTime.truncate(:second)
+  end
+end
+
+:ok
+```
+
+## Ready check
+
+```elixir
+priv = EphCore.Ephemeris.Kernels.base_dir()
+catalog_file = Path.join([priv, "stars", "hip_main.dat"])
+stars = Catalog.all_significant()
+
+Kino.Markdown.new("""
+**EphCore** `#{Application.spec(:eph_core, :vsn)}` · priv `#{priv}`
+
+Hipparcos catalog: #{if File.exists?(catalog_file), do: "✅ present", else: "❌ missing — run `mix eph.setup_stars` from repo root"}
+· **#{length(stars)}** named stars loaded.
+""")
+```
+
+## 1 — The named-star catalog
+
+`Catalog.all_significant/0` returns the curated bright stars with their raw
+J1991.25 catalog astrometry: position (RA/Dec), proper motion (mas/yr),
+parallax, and visual magnitude.
+
+```elixir
+catalog_rows =
+  for s <- Enum.sort_by(Catalog.all_significant(), & &1.magnitude) do
+    %{
+      hip: s.hip,
+      name: s.name,
+      mag: s.magnitude,
+      ra_deg: Float.round(s.ra_deg, 4),
+      dec_deg: Float.round(s.dec_deg, 4),
+      pm_ra_mas_yr: s.pm_ra_mas_yr,
+      pm_dec_mas_yr: s.pm_dec_mas_yr,
+      parallax_mas: s.parallax_mas
+    }
+  end
+
+Kino.DataTable.new(catalog_rows, name: "Hipparcos named stars (J1991.25 epoch)")
+```
+
+Total proper motion `μ = √(μ_α*² + μ_δ²)` tells you how fast each star slides
+across the sky. Barnard's-star-fast movers stand out immediately.
+
+```elixir
+pm_rows =
+  for s <- Catalog.all_significant() do
+    mu = :math.sqrt(s.pm_ra_mas_yr * s.pm_ra_mas_yr + s.pm_dec_mas_yr * s.pm_dec_mas_yr)
+    %{name: s.name, total_pm_mas_yr: Float.round(mu, 1)}
+  end
+
+Vl.new(width: 520, height: 260, title: "Total proper motion (mas/yr)")
+|> Vl.data_from_values(pm_rows)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:y, "name", type: :nominal, sort: "-x", title: nil)
+|> Vl.encode_field(:x, "total_pm_mas_yr", type: :quantitative, title: "μ (mas/yr)")
+|> Vl.encode_field(:color, "total_pm_mas_yr", type: :quantitative, scale: [scheme: "plasma"])
+```
+
+## 2 — A star's coordinates drift over the millennia
+
+`Position.compute/2` (no observer) applies proper motion *and* returns RA/Dec in
+the **equator of date**, so the reported position walks for two reasons:
+
+* **Precession of the equinox** — the ~50″/yr swing of the coordinate grid
+  itself (the dominant term over long spans: ~111° of RA over 8000 years).
+* **Proper motion** — the star's own space motion, layered on top. **Arcturus**
+  is a famous fast mover (~2.3″/yr), so its residual drift is unusually large.
+
+Let's track Arcturus from 3000 BC to 5000 AD.
+
+```elixir
+{:ok, arcturus} = Catalog.lookup(69673)
+
+# DateTime can't hold BCE years, so step jd_tt directly off the J2000 epoch.
+j2000_tt = ApparentPlace.utc_to_jd_tt(~U[2000-01-01 12:00:00Z])
+
+pm_track =
+  for year <- -3000..5000//500 do
+    jd_tt = j2000_tt + (year - 2000) * 365.25
+    pos = Position.compute(arcturus, jd_tt)
+
+    %{
+      year: year,
+      ra_deg: Float.round(pos.ra_deg, 4),
+      dec_deg: Float.round(pos.dec_deg, 4)
+    }
+  end
+
+Kino.DataTable.new(pm_track, name: "Arcturus RA/Dec drift (proper motion only)")
+```
+
+```elixir
+Vl.new(width: 520, height: 320, title: "Arcturus proper-motion track (RA vs Dec)")
+|> Vl.data_from_values(pm_track)
+|> Vl.mark(:line, point: true)
+|> Vl.encode_field(:x, "ra_deg", type: :quantitative, scale: [zero: false], title: "RA of date (°)")
+|> Vl.encode_field(:y, "dec_deg", type: :quantitative, scale: [zero: false], title: "Dec of date (°)")
+|> Vl.encode_field(:order, "year", type: :quantitative)
+|> Vl.encode_field(:color, "year", type: :quantitative, scale: [scheme: "turbo"])
+```
+
+The long sweep you see is mostly the equinox precessing under the star. To
+isolate Arcturus's *own* motion, look at its raw catalog proper motion from §1
+(~2.3″/yr): ~5° of true space motion accumulates over these 8000 years — small
+next to precession, but "fixed" is still only a matter of timescale.
+
+## 3 — Tonight's bright-star board
+
+Pick an observer and instant. Local sidereal time comes from the validated
+snapshot pipeline (request `:gast` for apparent sidereal time), then feeds
+`Position.compute/3` to project each star to altitude / azimuth.
+
+```elixir
+lat_in = Kino.Input.number("Latitude (°)", default: 44.9778)
+lon_in = Kino.Input.number("Longitude (°)", default: -93.2650)
+height_in = Kino.Input.number("Height (m)", default: 250)
+utc_in = Kino.Input.utc_datetime("UTC", default: ~N[2026-07-21 04:00:00])
+
+Kino.Layout.grid([lat_in, lon_in, height_in, utc_in], columns: 2)
+```
+
+```elixir
+observer = %{
+  lat_deg: Kino.Input.read(lat_in),
+  lon_deg: Kino.Input.read(lon_in),
+  height_m: Kino.Input.read(height_in)
+}
+
+utc = read_utc.(utc_in)
+jd_tt = ApparentPlace.utc_to_jd_tt(utc)
+
+# LAST (local apparent sidereal time) from the pipeline's earth-orientation pass.
+loc = %{lat: observer.lat_deg, lon: observer.lon_deg, height: observer.height_m}
+{:ok, obs_sun} = SnapshotPipeline.observe(utc, loc, [:sun], models: %{earth_orientation: :gast})
+last_deg = obs_sun.observer_position.last_deg
+
+Kino.Markdown.new("""
+Observer `#{observer.lat_deg}, #{observer.lon_deg}` · **#{DateTime.to_iso8601(utc)}**
+· LAST = **#{Float.round(last_deg, 3)}°** · JD(TT) = #{Float.round(jd_tt, 5)}
+""")
+```
+
+```elixir
+sky_rows =
+  for s <- Catalog.all_significant() do
+    pos = Position.compute(s, jd_tt, observer: observer, lst_deg: last_deg)
+
+    %{
+      name: pos.name,
+      mag: pos.magnitude,
+      altitude_deg: Float.round(pos.altitude_deg, 2),
+      azimuth_deg: Float.round(pos.azimuth_deg, 2),
+      ra_deg: Float.round(pos.ra_deg, 3),
+      dec_deg: Float.round(pos.dec_deg, 3),
+      up?: pos.altitude_deg > 0
+    }
+  end
+  |> Enum.sort_by(& &1.altitude_deg, :desc)
+
+Kino.DataTable.new(sky_rows, name: "Named stars — local alt/az")
+```
+
+```elixir
+Vl.new(width: 560, height: 320, title: "Star altitude (above/below horizon)")
+|> Vl.data_from_values(sky_rows)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "name", type: :nominal, sort: "-y", title: nil)
+|> Vl.encode_field(:y, "altitude_deg", type: :quantitative, title: "Altitude (°)")
+|> Vl.encode_field(:color, "up?", type: :nominal, title: "Above horizon?")
+```
+
+A sky-dome view: azimuth around, altitude as distance from the zenith. Points
+near the top of the plot are high overhead; points below the horizon line are
+not currently visible.
+
+```elixir
+Vl.new(width: 460, height: 360, title: "Sky dome — azimuth vs altitude")
+|> Vl.data_from_values(Enum.filter(sky_rows, & &1.up?))
+|> Vl.mark(:point, filled: true, size: 140)
+|> Vl.encode_field(:x, "azimuth_deg",
+  type: :quantitative,
+  scale: [domain: [0, 360]],
+  title: "Azimuth (° from N through E)"
+)
+|> Vl.encode_field(:y, "altitude_deg",
+  type: :quantitative,
+  scale: [domain: [0, 90]],
+  title: "Altitude (°)"
+)
+|> Vl.encode_field(:color, "mag", type: :quantitative, scale: [scheme: "viridis", reverse: true])
+|> Vl.encode_field(:size, "mag", type: :quantitative, scale: [reverse: true])
+```
+
+## 4 — Single-star deep dive
+
+Look up any HIP number and see every coordinate the module produces. The full
+star field of `hip_main.dat` is loaded — not just the named list — so obscure
+HIP numbers work too.
+
+```elixir
+hip_in = Kino.Input.text("Hipparcos number", default: "91262")
+Kino.render(hip_in)
+
+hip = hip_in |> Kino.Input.read() |> String.trim() |> String.to_integer()
+
+case Catalog.lookup(hip) do
+  {:ok, star} ->
+    pos = Position.compute(star, jd_tt, observer: observer, lst_deg: last_deg)
+
+    Kino.Markdown.new("""
+    ## HIP #{star.hip}#{if star.name, do: " — #{star.name}", else: ""}
+
+    | Quantity | Value |
+    |----------|-------|
+    | Visual magnitude | #{star.magnitude} |
+    | RA (of date) | #{Float.round(pos.ra_deg, 5)}° |
+    | Dec (of date) | #{Float.round(pos.dec_deg, 5)}° |
+    | Ecliptic longitude | #{Float.round(pos.ecliptic_lon_deg, 5)}° |
+    | Ecliptic latitude | #{Float.round(pos.ecliptic_lat_deg, 5)}° |
+    | Altitude | #{Float.round(pos.altitude_deg, 3)}° |
+    | Azimuth | #{Float.round(pos.azimuth_deg, 3)}° |
+    | Proper motion (RA) | #{star.pm_ra_mas_yr} mas/yr |
+    | Proper motion (Dec) | #{star.pm_dec_mas_yr} mas/yr |
+    | Parallax | #{star.parallax_mas} mas (≈ #{Float.round(1000.0 / max(star.parallax_mas, 1.0e-6), 2)} pc) |
+    """)
+
+  {:error, :not_found} ->
+    Kino.Markdown.new("HIP #{hip} not found in the catalog.")
+end
+```
+
+## Pitfalls & notes
+
+1. **`compute/3` needs `lst_deg` for alt/az** — pass both `:observer` and
+   `:lst_deg`; omit them and `altitude_deg`/`azimuth_deg` come back `nil`
+   (ecliptic + equatorial coordinates still populate).
+
+2. **RA/Dec are equator-*of-date*** — the module precesses the ICRF vector with
+   the IAU 2006 matrix, so values won't match a J2000 catalog printout by the
+   accumulated precession since 2000.
+
+3. **No aberration or parallax-of-motion here** — `Stars.Position` applies
+   proper motion + precession only. For planetary-grade apparent places see
+   `../01_observe_pipeline/05_apparent_place.livemd`; annual aberration shifts stars by ~20″ too.
+
+4. **Catalog loads lazily into `:persistent_term`** — the first `lookup/1` or
+   `all_significant/0` parses the whole file; subsequent reads are lock-free.
+
+## Key ideas
+
+* **Nothing is fixed** — proper motion is real astrometry, not a rounding error.
+  Arcturus and Barnard's Star visibly relocate within recorded history.
+* **`:persistent_term` as a star atlas** — the whole Hipparcos catalog lives in a
+  read-optimized term, parsed once at first touch. No DB, no GenServer.
+* **Same horizon math as the planets** — stars reuse
+  `Geometry.Horizontal.alt_az_from_direction/2`, the exact function the snapshot
+  pipeline uses for the Sun and Moon. One geometry layer, many bodies.

@@ -1,0 +1,436 @@
+# Skyfield Snapshot Cross-Check
+
+```elixir
+Mix.install(
+  [
+    {:eph_core, path: Path.expand("../..", __DIR__)},
+    {:kino, "~> 0.14"},
+    # Embeds CPython in this BEAM — no System.cmd / local venv required.
+    {:pythonx, "~> 0.4"}
+  ],
+  config: [
+    eph_core: [
+      # Planetary DE440s only. Avoid config_path: :eph_core here — that loads
+      # config.exs asteroid kernels before SPK.Server starts.
+      kernel_base_dir: Path.expand("../../priv", __DIR__),
+      spk_kernels: ["de440s.bsp"]
+    ]
+  ]
+)
+
+Logger.configure(level: :warning)
+```
+
+## Overview
+
+One-shot credibility check: EphCore `SnapshotPipeline.observe/4` and
+`ApparentPlace.look/2` vs Skyfield, in-process via
+[Pythonx](https://hexdocs.pm/pythonx) (`uv`-managed CPython + Skyfield).
+
+**Timing protocol** (so the numbers mean something):
+
+1. Install Python + Skyfield once (`uv_init` — first run can take a minute).
+2. **Warm** both engines (load `de440s.bsp`, touch caches) — not timed.
+3. Time matched physics on both sides: Skyfield's per-body loop already runs
+   `.apparent().altaz()` inside its timed pass, so Elixir's timed pass runs
+   `observe/4` **and** `ApparentPlace.look/2` per body together — not
+   `observe/4` alone. Reported at single-core (fair vs Skyfield's sequential
+   loop) and at Elixir's default multi-core fan-out (a separate, labeled
+   concurrency-bonus row — not folded into the "language speed" ratio).
+
+Still a **credibility check**, not a race. For automated regression gates use
+`mix eph.snapshot_sanity_check` (dev/test only). Full-year rise/set parity is
+demonstrated in [`01_almanac.livemd`](01_almanac.livemd).
+
+Pipeline stage tour (no Python): [`01_snapshot_pipeline.livemd`](../01_observe_pipeline/01_snapshot_pipeline.livemd).
+
+**How to open:** Install [Livebook](https://livebook.dev/), open this `.livemd`,
+evaluate the setup cell. Kernels must already be under `eph_core/priv/ephemeris/`
+(run `mix eph.download_kernels` in the repo first; the setup cell will not start without baseline files).
+
+## Helpers
+
+```elixir
+# Kino.Input.utc_datetime/2 reads as NaiveDateTime (UTC) or DateTime depending on version.
+read_utc = fn input ->
+  case Kino.Input.read(input) do
+    %DateTime{} = dt ->
+      DateTime.truncate(dt, :second)
+
+    %NaiveDateTime{} = ndt ->
+      ndt |> DateTime.from_naive!("Etc/UTC") |> DateTime.truncate(:second)
+  end
+end
+
+:ok
+```
+
+## Ready check
+
+```elixir
+priv = EphCore.Ephemeris.Kernels.base_dir()
+spk = Path.join([priv, "ephemeris", "spk", "de440s.bsp"])
+
+Kino.Markdown.new("""
+**EphCore** `#{Application.spec(:eph_core, :vsn)}` · priv `#{priv}`
+
+SPK `de440s.bsp`: #{if File.exists?(spk), do: "✅ present", else: "❌ missing — run `mix eph.download_kernels`"}
+""")
+```
+
+## 1 — Observer & epoch
+
+Minneapolis defaults — edit and re-evaluate.
+
+```elixir
+lat_in = Kino.Input.number("Latitude (°)", default: 44.9778)
+lon_in = Kino.Input.number("Longitude (°)", default: -93.2650)
+height_in = Kino.Input.number("Height (m)", default: 250)
+utc_in = Kino.Input.utc_datetime("UTC", default: ~N[2026-07-21 17:00:00])
+
+Kino.Layout.grid([lat_in, lon_in, height_in, utc_in], columns: 2)
+```
+
+```elixir
+location = %{
+  lat: Kino.Input.read(lat_in),
+  lon: Kino.Input.read(lon_in),
+  height: Kino.Input.read(height_in)
+}
+
+datetime = read_utc.(utc_in)
+bodies = [:sun, :moon, :mercury, :venus, :mars, :jupiter, :saturn]
+
+Kino.Markdown.new("""
+**Inputs locked**
+
+| param | value |
+|-------|-------|
+| datetime | `#{DateTime.to_iso8601(datetime)}` |
+| location | `#{location.lat}°, #{location.lon}°` @ #{location.height} m |
+| bodies | `#{inspect(bodies)}` |
+""")
+```
+
+## 2 — Like-for-like alignment
+
+What this notebook compares (and what it deliberately does *not*):
+
+* Shared `de440s.bsp`; outer planets are barycenters.
+* **Geometric** lon/lat/RA/Dec/rate: `observe/4` vs Skyfield astrometric
+  (expect residual ″ under Mix's ~72″ gate — not identically zero).
+* **Apparent** alt/az: `ApparentPlace.look/2` vs Skyfield `.apparent().altaz()`
+  — **not** `obs.bodies` (those stay geometric even with correction flags).
+* Correction flags on `observe/4` only fill apparent *geocentric* lon/lat;
+  they do not change pipeline alt/az.
+
+## 3 — Python env (`uv` + Skyfield) — optional
+
+This notebook is **optional**. It needs [Pythonx](https://hexdocs.pm/pythonx) to
+embed CPython in the BEAM. First evaluation downloads CPython + Skyfield via `uv`
+into Pythonx's cache (network required once). Re-runs are fast. If Pythonx init
+fails, skip §4–§5 — the pipeline tour in
+[`01_snapshot_pipeline.livemd`](../01_observe_pipeline/01_snapshot_pipeline.livemd) needs no Python.
+
+```elixir
+kernel_path =
+  EphCore.Ephemeris.Kernels.spk_path("de440s.bsp")
+
+pythonx_ok? =
+  try do
+    # native_tls: true helps when Erlang's TLS stack rejects GitHub/uv certs
+    # (corporate proxies, some macOS setups). Harmless otherwise.
+    Pythonx.uv_init(
+      """
+      [project]
+      name = "eph-core-snapshot-skyfield"
+      version = "0.0.0"
+      requires-python = ">=3.11"
+      dependencies = [
+        "skyfield>=1.49",
+        "numpy>=1.24"
+      ]
+      """,
+      native_tls: true
+    )
+
+    true
+  rescue
+    e ->
+      Kino.render(
+        Kino.Markdown.new("""
+        **Pythonx init failed** — `#{Exception.message(e)}`
+
+        Need a network on first run (`uv` fetches CPython + Skyfield). Then re-evaluate.
+        If the error is a TLS / certificate alert fetching `uv`, try again or install
+        `uv` manually; Pythonx caches it under `~/Library/Caches/pythonx/` (macOS).
+        """)
+      )
+
+      false
+  end
+
+Kino.Markdown.new(
+  if pythonx_ok? do
+    "✅ Pythonx ready · kernel `#{kernel_path}`"
+  else
+    "❌ Pythonx not ready — fix §3 before §4/§5"
+  end
+)
+```
+
+## 4 — Warm load (not timed)
+
+Load the BSP + timescale into Python globals and run one Elixir observe so
+neither side pays cold-start in the timed cell.
+
+```elixir
+sf_bodies = bodies
+body_names = Enum.map(sf_bodies, &Atom.to_string/1)
+
+{py_warm, py_globals} =
+  if pythonx_ok? do
+    Pythonx.eval(
+      """
+      from skyfield.api import load, wgs84
+      from skyfield.framelib import ecliptic_frame
+
+      # Pythonx encodes Elixir binaries as Python bytes — decode paths/names.
+      def _s(x):
+          return x.decode() if isinstance(x, (bytes, bytearray)) else x
+
+      BODY_MAP = {
+          "sun": "sun",
+          "moon": "moon",
+          "mercury": "mercury",
+          "venus": "venus",
+          "mars": "mars barycenter",
+          "jupiter": "jupiter barycenter",
+          "saturn": "saturn barycenter",
+          "uranus": "uranus barycenter",
+          "neptune": "neptune barycenter",
+          "pluto": "pluto barycenter",
+      }
+
+      ts = load.timescale()
+      planets = load(_s(kernel_path))
+      earth = planets["earth"]
+      "warm"
+      """,
+      %{"kernel_path" => kernel_path}
+    )
+  else
+    {nil, %{}}
+  end
+
+_ =
+  if pythonx_ok? do
+    EphCore.SnapshotPipeline.observe(datetime, location, sf_bodies,
+      models: %{earth_orientation: :gast}
+    )
+  end
+
+Kino.Markdown.new(
+  if pythonx_ok? do
+    "Warmed · Python `#{inspect(Pythonx.decode(py_warm))}` · Elixir observe once · bodies `#{inspect(body_names)}`"
+  else
+    "Skipped warm — Pythonx not ready"
+  end
+)
+```
+
+## 5 — Timed compute + diffs
+
+```elixir
+angle_delta_deg = fn a, b ->
+  d = abs(a - b)
+  min(d, 360.0 - d)
+end
+
+skyfield_compute = fn globals ->
+  Pythonx.eval(
+    """
+    def _s(x):
+        return x.decode() if isinstance(x, (bytes, bytearray)) else x
+
+    t = ts.utc(year, month, day, hour, minute, second)
+    dt_days = motion_dt_minutes / 1440.0
+    # Vectorize t_prev / t / t_next — Skyfield's natural fast path for rates.
+    t3 = ts.tt_jd([t.tt - dt_days, t.tt, t.tt + dt_days])
+    observer = wgs84.latlon(lat, lon, elevation_m=height)
+    topos = earth + observer
+    out = {}
+    for name in bodies:
+        key = _s(name)
+        target = planets[BODY_MAP[key]]
+        geo3 = earth.at(t3).observe(target)
+        geo = geo3[1]
+        app = topos.at(t).observe(target).apparent()
+        ra, dec, _ = geo.radec()
+        alt, az, _ = app.altaz()
+        lat_tod, lon_tod, _ = geo.frame_latlon(ecliptic_frame)
+        lon_prev = float(geo3[0].frame_latlon(ecliptic_frame)[1].degrees)
+        lon_next = float(geo3[2].frame_latlon(ecliptic_frame)[1].degrees)
+        delta = lon_next - lon_prev
+        if delta > 180.0:
+            delta -= 360.0
+        elif delta < -180.0:
+            delta += 360.0
+        rate = float(delta * (720.0 / motion_dt_minutes))
+        out[key] = {
+            "ra": float(ra._degrees),
+            "dec": float(dec.degrees),
+            "alt_apparent": float(alt.degrees),
+            "az_apparent": float(az.degrees),
+            "lon_tod": float(lon_tod.degrees),
+            "lat_tod": float(lat_tod.degrees),
+            "rate": rate,
+            "retrograde": bool(rate < 0),
+        }
+    out
+    """,
+    Map.merge(globals, %{
+      "year" => datetime.year,
+      "month" => datetime.month,
+      "day" => datetime.day,
+      "hour" => datetime.hour,
+      "minute" => datetime.minute,
+      "second" => datetime.second,
+      "lat" => location.lat * 1.0,
+      "lon" => location.lon * 1.0,
+      "height" => location.height * 1.0,
+      "bodies" => body_names,
+      "motion_dt_minutes" => 30
+    })
+  )
+end
+
+if pythonx_ok? do
+  alias EphCore.Corrections.ApparentPlace
+
+  # One more Python touch so the timed pass isn't the first eval after warm.
+  {_prime, py_globals} = skyfield_compute.(py_globals)
+
+  # Skyfield's timed compute() already runs topos.at(t).observe(target).apparent()
+  # per body (light-time + aberration + alt/az), so a fair Elixir comparison must
+  # pay for the same apparent transform inside its own timed block — not call
+  # ApparentPlace.look/2 afterward, uncharged. This "matched" pass runs observe/4
+  # AND the per-body apparent look together, timed once at single-core (fair vs
+  # Skyfield's sequential body loop) and once at Elixir's default multi-core
+  # fan-out (reported separately — it's a concurrency bonus, not a language
+  # speed claim).
+  matched_pass = fn parallel? ->
+    {:ok, obs} =
+      EphCore.SnapshotPipeline.observe(datetime, location, sf_bodies,
+        models: %{earth_orientation: :gast},
+        parallel: parallel?
+      )
+
+    frame = ApparentPlace.frame(datetime, location)
+    _looks = for body <- sf_bodies, do: ApparentPlace.look(frame, body)
+    obs
+  end
+
+  _ = matched_pass.(false)
+  _ = matched_pass.(true)
+
+  {elixir_single_us, _} = :timer.tc(fn -> matched_pass.(false) end)
+  {elixir_multi_us, {:ok, obs_sf}} = :timer.tc(fn -> {:ok, matched_pass.(true)} end)
+
+  {skyfield_us, {sf_result, _py_globals}} = :timer.tc(fn -> skyfield_compute.(py_globals) end)
+  sf_bodies_map = Pythonx.decode(sf_result)
+
+  # Apparent topocentric look — like-for-like with Skyfield .apparent().altaz().
+  ap_frame = ApparentPlace.frame(datetime, location)
+
+  geo_rows =
+    for body <- sf_bodies do
+      name = Atom.to_string(body)
+      ssp = obs_sf.solar_system_positions[body]
+      motion = obs_sf.motion[body]
+      sfb = sf_bodies_map[name]
+
+      lon_d = angle_delta_deg.(ssp.ecliptic_longitude, sfb["lon_tod"])
+      lat_d = abs(ssp.ecliptic_latitude - sfb["lat_tod"])
+      ra_d = angle_delta_deg.(ssp.right_ascension, sfb["ra"])
+      dec_d = abs(ssp.declination - sfb["dec"])
+      rate_d = abs(motion.ecliptic_lon_rate_deg_per_day - sfb["rate"])
+
+      %{
+        body: body,
+        d_lon_arcsec: Float.round(lon_d * 3600, 2),
+        d_lat_arcsec: Float.round(lat_d * 3600, 2),
+        d_ra_arcsec: Float.round(ra_d * 3600, 2),
+        d_dec_arcsec: Float.round(dec_d * 3600, 2),
+        d_rate_deg_day: Float.round(rate_d, 5),
+        retrograde_match: motion.retrograde == sfb["retrograde"]
+      }
+    end
+
+  apparent_rows =
+    for body <- sf_bodies do
+      name = Atom.to_string(body)
+      look = ApparentPlace.look(ap_frame, body)
+      sfb = sf_bodies_map[name]
+      alt_d = abs(look.alt_deg - sfb["alt_apparent"])
+      az_d = angle_delta_deg.(look.az_deg, sfb["az_apparent"])
+
+      %{
+        body: body,
+        d_alt_arcmin: Float.round(alt_d * 60, 3),
+        d_az_arcmin: Float.round(az_d * 60, 3)
+      }
+    end
+
+  timing_rows = [
+    %{
+      engine: "EphCore matched (observe/4 + ApparentPlace.look/2), single-core",
+      wall_ms: Float.round(elixir_single_us / 1000, 2),
+      notes: "fair vs Skyfield's sequential per-body loop"
+    },
+    %{
+      engine: "EphCore matched (observe/4 + ApparentPlace.look/2), multi-core (default)",
+      wall_ms: Float.round(elixir_multi_us / 1000, 2),
+      notes: "Elixir's free concurrency — separate axis, not a language-speed claim"
+    },
+    %{
+      engine: "Skyfield (Pythonx)",
+      wall_ms: Float.round(skyfield_us / 1000, 2),
+      notes: "in-process CPython; kernel warm; vectorized t±dt; incl. .apparent().altaz()"
+    }
+  ]
+
+  Kino.render(Kino.DataTable.new(timing_rows, name: "One-shot wall time (warm compute, matched physics)"))
+
+  Kino.render(
+    Kino.Markdown.new("""
+    **Epoch:** `#{DateTime.to_iso8601(datetime)}` @ #{location.lat}°, #{location.lon}°
+    **Runtime:** Pythonx + `uv` (Skyfield ≥ 1.49) · shared `de440s.bsp`
+
+    Both engines now pay for the same physics in the timed pass: light-time +
+    aberration + apparent alt/az (Skyfield's `.apparent().altaz()`, Elixir's
+    `observe/4` + `ApparentPlace.look/2`). Fair ratio is single-core vs
+    single-core; the multi-core row is Elixir's default fan-out reported
+    separately since a 7-body job is too small for a Python dev to reach for
+    `multiprocessing`/threads (spawn/GIL overhead would dominate).
+
+    Geometric table: `observe/4` vs Skyfield astrometric (″). Apparent table:
+    `ApparentPlace.look/2` vs Skyfield `.apparent()` (′). Mix gates ≈ 72″ / 0.6°.
+    """)
+  )
+
+  Kino.render(Kino.DataTable.new(geo_rows, name: "Geometric vs geometric (astrometric)"))
+  Kino.DataTable.new(apparent_rows, name: "Apparent vs apparent alt/az (ApparentPlace.look)")
+else
+  Kino.Markdown.new("Skipped timed compare — re-evaluate **§3** successfully first.")
+end
+```
+
+## Next ideas
+
+Room to grow this notebook without crowding the pipeline tour:
+
+* Geometric vs apparent *geocentric* lon matrix (station-timing story)
+* Compare residuals against `mix eph.snapshot_sanity_check` output
+* Multi-epoch spot checks (same observer, several UTC stamps)
+* Star alt/az with matched correction sets (`03_fixed_stars.livemd`)

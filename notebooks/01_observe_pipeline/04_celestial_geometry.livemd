@@ -1,0 +1,267 @@
+# EphCore.Geometry — Coordinate Systems & the Celestial Sphere
+
+```elixir
+Mix.install(
+  [
+    {:eph_core, path: Path.expand("../..", __DIR__)},
+    {:kino, "~> 0.14"},
+    {:kino_vega_lite, "~> 0.1"}
+  ],
+  config: [
+    eph_core: [
+      # Planetary DE440s only. Avoid config_path: :eph_core here — that loads
+      # config.exs asteroid kernels before SPK.Server starts.
+      kernel_base_dir: Path.expand("../../priv", __DIR__),
+      spk_kernels: ["de440s.bsp"]
+    ]
+  ]
+)
+
+Logger.configure(level: :warning)
+```
+
+## Overview
+
+Every position in the engine is a 3-vector that gets *rotated* between frames.
+This tour walks the `EphCore.Geometry.*` layer that every other module leans on:
+
+* `Geodetic` — WGS84 lat/lon/height → Earth-centred-Earth-fixed (ECEF) km, plus
+  the local **East / North / Up** basis (the ellipsoid normal, not the radial).
+* `Horizontal` — dot a direction against the E/N/U basis → altitude / azimuth.
+* `Ecliptic` — rotate an ICRF vector into J2000 / mean-of-date / true-of-date
+  ecliptic longitude & latitude (obliquity + precession + nutation).
+* `Projection` — the closed-form equator↔ecliptic longitude map.
+* `CelestialSphere` — celestial poles + great-circle ring samples (the equator
+  and the ecliptic), projected into the observer's local sky.
+
+One position vector, a stack of 3×3 matrices, and every coordinate system falls out.
+
+**How to open:** Install [Livebook](https://livebook.dev/), open this `.livemd`,
+evaluate the setup cell. Kernels must be under `eph_core/priv/ephemeris/`.
+
+## Helpers
+
+```elixir
+alias VegaLite, as: Vl
+alias EphCore.Geometry.{Geodetic, Horizontal, Ecliptic, Projection, CelestialSphere}
+alias EphCore.Ephemeris
+alias EphCore.Corrections.ApparentPlace
+alias EphCore.SnapshotPipeline
+alias AstroUtils.Vector
+
+read_utc = fn input ->
+  case Kino.Input.read(input) do
+    %DateTime{} = dt -> DateTime.truncate(dt, :second)
+    %NaiveDateTime{} = ndt -> ndt |> DateTime.from_naive!("Etc/UTC") |> DateTime.truncate(:second)
+  end
+end
+
+:ok
+```
+
+## Ready check
+
+```elixir
+Kino.Markdown.new("""
+**EphCore** `#{Application.spec(:eph_core, :vsn)}` loaded. Geometry modules are
+pure functions — no GenServers required for this tour (the SPK server is only
+used for the worked planetary vector in §2).
+""")
+```
+
+## Observer & instant
+
+```elixir
+lat_in = Kino.Input.number("Latitude (°)", default: 44.9778)
+lon_in = Kino.Input.number("Longitude (°)", default: -93.2650)
+height_in = Kino.Input.number("Height (m)", default: 250)
+utc_in = Kino.Input.utc_datetime("UTC", default: ~N[2026-07-21 04:00:00])
+
+Kino.Layout.grid([lat_in, lon_in, height_in, utc_in], columns: 2)
+```
+
+```elixir
+lat = Kino.Input.read(lat_in)
+lon = Kino.Input.read(lon_in)
+height = Kino.Input.read(height_in)
+utc = read_utc.(utc_in)
+location = %{lat: lat, lon: lon, height: height}
+jd_tt = ApparentPlace.utc_to_jd_tt(utc)
+
+Kino.Markdown.new("Observer `#{lat}, #{lon}` (#{height} m) · **#{DateTime.to_iso8601(utc)}** · JD(TT) #{Float.round(jd_tt, 5)}")
+```
+
+## 1 — Ground truth: geodetic → ECEF and the local basis
+
+`to_ecef_km/3` places you on the WGS84 ellipsoid; `enu_basis_ecef/2` gives the
+local horizon frame. Note `up` is the **ellipsoid normal**, so the horizon plane
+accounts for the deflection of the vertical — using the geocentric radial
+instead would introduce a systematic 1–3 minute rise/set error.
+
+```elixir
+{ex, ey, ez} = ecef = Geodetic.to_ecef_km(lat, lon, height)
+basis = Geodetic.enu_basis_ecef(lat, lon)
+
+Kino.Markdown.new("""
+**ECEF position:** `{#{Float.round(ex, 1)}, #{Float.round(ey, 1)}, #{Float.round(ez, 1)}}` km
+(distance from geocentre: #{Float.round(Vector.magnitude(ecef), 1)} km)
+
+| Local axis | ECEF unit vector |
+|------------|------------------|
+| East  | #{inspect(Enum.map(Tuple.to_list(basis.east), &Float.round(&1, 4)))} |
+| North | #{inspect(Enum.map(Tuple.to_list(basis.north), &Float.round(&1, 4)))} |
+| Up    | #{inspect(Enum.map(Tuple.to_list(basis.up), &Float.round(&1, 4)))} |
+
+The three axes are mutually orthogonal unit vectors — a right-handed frame glued
+to your patch of ground and spinning with the Earth.
+""")
+```
+
+## 2 — One vector, three ecliptic frames
+
+Take a real planetary geocentric vector and rotate it into each ecliptic frame.
+J2000 is the fixed catalog frame; mean-of-date adds precession; true-of-date
+adds nutation on top. The differences are the slow wobble of Earth's axis.
+
+```elixir
+body_in = Kino.Input.select("Body", for(b <- [:mars, :jupiter, :saturn, :venus, :moon], do: {b, b}))
+Kino.render(body_in)
+body = Kino.Input.read(body_in)
+
+{:ok, state} = Ephemeris.geocentric_state(jd_tt, body)
+vec = state.geocentric_position_km
+
+{j2000_lon, j2000_lat} = Ecliptic.icrf_to_j2000_lon_lat(vec)
+{mean_lon, mean_lat} = Ecliptic.icrf_to_mean_lon_lat(vec, jd_tt)
+{true_lon, true_lat} = Ecliptic.icrf_to_true_lon_lat(vec, jd_tt)
+
+frame_rows = [
+  %{frame: "J2000 ecliptic", lon_deg: Float.round(j2000_lon, 6), lat_deg: Float.round(j2000_lat, 6)},
+  %{frame: "mean of date", lon_deg: Float.round(mean_lon, 6), lat_deg: Float.round(mean_lat, 6)},
+  %{frame: "true of date", lon_deg: Float.round(true_lon, 6), lat_deg: Float.round(true_lat, 6)}
+]
+
+Kino.DataTable.new(frame_rows, name: "#{body}: same vector, three ecliptic frames")
+```
+
+```elixir
+Kino.Markdown.new("""
+**Precession** (J2000 → mean of date): Δlon = #{Float.round((mean_lon - j2000_lon) * 3600, 1)}″
+· **Nutation** (mean → true of date): Δlon = #{Float.round((true_lon - mean_lon) * 3600, 1)}″
+
+Precession is the ~50″/yr drift of the equinox; nutation is the ±9″ nod driven
+by the 18.6-year lunar node. Both are baked into the true-of-date transform the
+snapshot pipeline uses.
+""")
+```
+
+## 3 — The obliquity projection
+
+`Projection.equator_ra_to_ecliptic_lon/2` is the closed-form map from a point on
+the celestial equator (Dec = 0) to its ecliptic longitude, given the obliquity
+ε. Plotting it across a full turn shows how the two great circles shear apart and
+re-cross at the equinoxes (0°, 180°) and solstices (90°, 270°).
+
+```elixir
+obliquity = 23.4392911
+
+proj_rows =
+  for ra <- 0..360//5 do
+    ecl = Projection.equator_ra_to_ecliptic_lon(ra * 1.0, obliquity)
+    %{ra_deg: ra, ecliptic_lon_deg: Float.round(ecl, 4), offset_deg: Float.round(ecl - ra, 4)}
+  end
+
+Vl.new(width: 560, height: 300, title: "Equator RA → ecliptic longitude (ε = 23.44°)")
+|> Vl.data_from_values(proj_rows)
+|> Vl.mark(:line, point: false)
+|> Vl.encode_field(:x, "ra_deg", type: :quantitative, title: "Right ascension (°)")
+|> Vl.encode_field(:y, "offset_deg", type: :quantitative, title: "Ecliptic lon − RA (°)")
+```
+
+The offset swings to a maximum near the solstices (where the ecliptic is most
+"tilted" relative to the equator) and vanishes at the equinox crossings.
+
+## 4 — The celestial sphere in your local sky
+
+`CelestialSphere.geometry_payload/1` takes a full `%Observation{}` and returns
+the two celestial **poles** and great-circle **ring** samples — the equator and
+the ecliptic — all expressed in the observer's **altitude / azimuth**. That lets
+us draw the sky's scaffolding as it's actually oriented over your horizon.
+
+```elixir
+{:ok, obs} =
+  SnapshotPipeline.observe(utc, location, [:sun],
+    models: %{earth_orientation: :gast, ecliptic_frame: :true_of_date},
+    geometry: %{ring_samples: 72}
+  )
+
+payload = CelestialSphere.geometry_payload(obs)
+
+Kino.Markdown.new("""
+**Celestial poles (local alt/az):**
+
+| Pole | Altitude | Azimuth |
+|------|----------|---------|
+| Equatorial (spin axis) | #{Float.round(payload.poles.equatorial.altitude_deg, 3)}° | #{Float.round(payload.poles.equatorial.azimuth_deg, 3)}° |
+| Ecliptic (orbit axis)  | #{Float.round(payload.poles.ecliptic.altitude_deg, 3)}° | #{Float.round(payload.poles.ecliptic.azimuth_deg, 3)}° |
+
+The equatorial pole's altitude equals your **latitude** — Polaris sits there.
+Ring samples: #{payload.ring_samples} per circle.
+""")
+```
+
+```elixir
+ring_points =
+  Enum.map(payload.rings.equatorial, &Map.put(&1, :ring, "equator")) ++
+    Enum.map(payload.rings.ecliptic, &Map.put(&1, :ring, "ecliptic"))
+
+ring_rows =
+  for p <- ring_points do
+    %{
+      azimuth_deg: Float.round(p.azimuth_deg, 3),
+      altitude_deg: Float.round(p.altitude_deg, 3),
+      ring: p.ring
+    }
+  end
+
+Vl.new(width: 600, height: 340, title: "Celestial equator & ecliptic across the local sky")
+|> Vl.data_from_values(ring_rows)
+|> Vl.mark(:point, filled: true, size: 45)
+|> Vl.encode_field(:x, "azimuth_deg", type: :quantitative,
+  scale: [domain: [0, 360]], title: "Azimuth (° from N through E)")
+|> Vl.encode_field(:y, "altitude_deg", type: :quantitative,
+  scale: [domain: [-90, 90]], title: "Altitude (°)  — 0 = horizon")
+|> Vl.encode_field(:color, "ring", type: :nominal, title: "Great circle")
+```
+
+Points above altitude 0 are above the horizon; the two rings cross where the
+ecliptic meets the equator (the equinoxes). Re-run with a different UTC and watch
+both circles wheel as the Earth turns.
+
+## Pitfalls & notes
+
+1. **`up` is the ellipsoid normal, not the radial** — `Geodetic.enu_basis_ecef/2`
+   deliberately uses the geodetic vertical; this ~0.1–0.2° deflection is what
+   keeps rise/set/transit inside the 1-second contract.
+
+2. **Ecliptic frame is a *model* choice** — `:j2000`, `:mean_of_date`, and
+   `:true_of_date` differ by precession/nutation. The pipeline defaults you pick
+   in `models:` flow straight into `CelestialSphere` via the `%Observation{}`.
+
+3. **`geometry_payload/1` needs a real observation** — it reads
+   `observer_position.local_basis` and `intent.models`, so build it from
+   `SnapshotPipeline.observe/4`, not a hand-rolled map.
+
+4. **Poles are directions, not points** — the payload returns unit-direction
+   alt/az; there's no distance. A ring sample below altitude 0 is simply below
+   your horizon at that instant.
+
+## Key ideas
+
+* **Everything is a rotation** — ECEF, ecliptic, equatorial, horizon: each is one
+  3×3 matrix away from ICRF. The geometry layer is small because the physics is
+  linear algebra.
+* **Your latitude is written in the sky** — the celestial pole's altitude *is* your
+  latitude. The `CelestialSphere` payload makes that literally plottable.
+* **Precession vs nutation, side by side** — §2 separates the 50″/yr secular drift
+  from the 9″ nodal nod using the exact matrices the almanac trusts.

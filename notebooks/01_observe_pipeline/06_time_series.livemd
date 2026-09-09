@@ -1,0 +1,295 @@
+# EphCore.TimeSeries — Grid Computing Tour
+
+```elixir
+Mix.install(
+  [
+    {:eph_core, path: Path.expand("../..", __DIR__)},
+    {:kino, "~> 0.14"},
+    {:kino_vega_lite, "~> 0.1"}
+  ],
+  config: [
+    eph_core: [
+      # Planetary DE440s only. Avoid config_path: :eph_core here — that loads
+      # config.exs asteroid kernels before SPK.Server starts.
+      kernel_base_dir: Path.expand("../../priv", __DIR__),
+      spk_kernels: ["de440s.bsp"]
+    ]
+  ]
+)
+
+Logger.configure(level: :warning)
+```
+
+## Overview
+
+Batch ephemeris for charts and event searches. `TimeSeries.compute/3` evaluates a
+grid of timestamps in one pass — ecliptic longitudes, declinations, and motion
+rates — while `add_horizon_geometry/2` layers on alt/az, LST, and the
+Ascendant/MC axes. Useful for charts, motion curves, and horizon overlays.
+
+**How to open:** Install [Livebook](https://livebook.dev/), open this `.livemd`,
+evaluate the setup cell. Kernels must already be under `eph_core/priv/ephemeris/`
+(run `mix eph.download_kernels` in the repo first; the setup cell will not start without baseline files).
+
+## Helpers
+
+```elixir
+alias VegaLite, as: Vl
+
+# Kino.Input.utc_datetime/2 reads as NaiveDateTime (UTC) or DateTime depending on version.
+read_utc = fn input ->
+  case Kino.Input.read(input) do
+    %DateTime{} = dt ->
+      DateTime.truncate(dt, :second)
+
+    %NaiveDateTime{} = ndt ->
+      ndt |> DateTime.from_naive!("Etc/UTC") |> DateTime.truncate(:second)
+  end
+end
+
+:ok
+```
+
+## Ready check
+
+```elixir
+priv = EphCore.Ephemeris.Kernels.base_dir()
+spk = Path.join([priv, "ephemeris", "spk", "de440s.bsp"])
+
+Kino.Markdown.new("""
+**EphCore** `#{Application.spec(:eph_core, :vsn)}` · priv `#{priv}`
+
+SPK `de440s.bsp`: #{if File.exists?(spk), do: "✅ present", else: "❌ missing — run `mix eph.download_kernels`"}
+""")
+```
+
+## Observer & time range
+
+Minneapolis defaults — edit and re-evaluate. We build 96 timestamps spanning
+one UTC day at 15-minute intervals, light enough to keep Livebook snappy.
+
+```elixir
+lat_in = Kino.Input.number("Latitude (°)", default: 44.9778)
+lon_in = Kino.Input.number("Longitude (°)", default: -93.2650)
+height_in = Kino.Input.number("Height (m)", default: 250)
+start_in = Kino.Input.utc_datetime("Start UTC", default: ~N[2026-07-21 00:00:00])
+
+Kino.Layout.grid([lat_in, lon_in, height_in, start_in], columns: 2)
+```
+
+```elixir
+observer = %{
+  lat: Kino.Input.read(lat_in),
+  lon: Kino.Input.read(lon_in),
+  height: Kino.Input.read(height_in)
+}
+
+start_dt = read_utc.(start_in)
+
+timestamps =
+  for i <- 0..95 do
+    DateTime.add(start_dt, i * 15 * 60, :second)
+  end
+
+Kino.Markdown.new("""
+**#{length(timestamps)} samples** from `#{DateTime.to_iso8601(List.first(timestamps))}`
+to `#{DateTime.to_iso8601(List.last(timestamps))}` (15-min cadence)
+
+Observer: `#{observer.lat}°, #{observer.lon}°` at #{observer.height} m
+""")
+```
+
+## Compute the grid
+
+`compute/3` returns ecliptic longitudes (true-of-date), equatorial declinations
+(J2000 ICRF), and motion rates (°/day via central difference) for every body at
+every timestamp. Pass `:observer` for topocentric; omit it for geocentric.
+
+```elixir
+bodies = [:sun, :moon, :mars, :jupiter, :saturn]
+
+{us, {:ok, grid}} =
+  :timer.tc(fn ->
+    EphCore.TimeSeries.compute(timestamps, bodies, observer: observer)
+  end)
+
+Kino.Markdown.new("""
+Grid: **#{length(bodies)} bodies × #{length(timestamps)} timestamps** computed in
+**#{Float.round(us / 1000, 1)} ms**
+
+Keys: `#{inspect(Map.keys(grid) |> Enum.sort())}`
+""")
+```
+
+### Positions snapshot
+
+Ecliptic longitudes at the first, middle, and last timestamps.
+
+```elixir
+sample_indices = [0, div(length(timestamps) - 1, 2), length(timestamps) - 1]
+
+pos_rows =
+  for i <- sample_indices, body <- bodies do
+    %{
+      utc: DateTime.to_iso8601(Enum.at(grid.timestamps, i)),
+      body: body,
+      ecl_lon_deg: Float.round(Enum.at(grid.positions[body], i), 4),
+      dec_deg: Float.round(Enum.at(grid.declinations[body], i), 4),
+      rate_deg_day: Float.round(Enum.at(grid.motion[body], i), 4)
+    }
+  end
+
+Kino.DataTable.new(pos_rows, name: "Position samples (start / mid / end)")
+```
+
+### Motion direction
+
+Positive rates mean direct motion; negative means retrograde. Quick scan across
+all bodies at the midpoint.
+
+```elixir
+mid = div(length(timestamps) - 1, 2)
+
+motion_rows =
+  for body <- bodies do
+    rate = Enum.at(grid.motion[body], mid)
+
+    %{
+      body: body,
+      rate_deg_day: Float.round(rate, 4),
+      direction: if(rate >= 0, do: "direct", else: "retrograde")
+    }
+  end
+
+Kino.DataTable.new(motion_rows, name: "Motion at midpoint")
+```
+
+## Add horizon geometry
+
+`add_horizon_geometry/2` augments the grid with per-timestamp altitude, azimuth,
+local sidereal time, obliquity, and the Ascendant/MC ecliptic longitudes.
+
+```elixir
+{hz_us, grid_hz} =
+  :timer.tc(fn -> EphCore.TimeSeries.add_horizon_geometry(grid, observer) end)
+
+Kino.Markdown.new("""
+Horizon geometry added in **#{Float.round(hz_us / 1000, 1)} ms**.
+
+New keys: `:axes`, `:altitudes`, `:azimuths`, `:lst`, `:obliquity_deg`, `:observer_lat`
+""")
+```
+
+```elixir
+horizon_rows =
+  for i <- sample_indices, body <- bodies do
+    %{
+      utc: DateTime.to_iso8601(Enum.at(grid_hz.timestamps, i)),
+      body: body,
+      alt_deg: Float.round(Enum.at(grid_hz.altitudes[body], i), 2),
+      az_deg: Float.round(Enum.at(grid_hz.azimuths[body], i), 2),
+      lst_deg: Float.round(Enum.at(grid_hz.lst, i), 2),
+      asc_deg: Float.round(Enum.at(grid_hz.axes.asc, i), 2),
+      mc_deg: Float.round(Enum.at(grid_hz.axes.mc, i), 2)
+    }
+  end
+
+Kino.DataTable.new(horizon_rows, name: "Horizon geometry samples")
+```
+
+## Charts — ecliptic longitude vs time
+
+Flatten the grid into chart-friendly rows, then plot ecliptic longitude curves
+for each body over the day.
+
+```elixir
+lon_rows =
+  for i <- 0..(length(timestamps) - 1), body <- bodies do
+    %{
+      hour: i * 0.25,
+      body: Atom.to_string(body),
+      ecl_lon_deg: Enum.at(grid.positions[body], i)
+    }
+  end
+
+Vl.new(width: 560, height: 320, title: "Ecliptic longitude over 24 h")
+|> Vl.data_from_values(lon_rows)
+|> Vl.mark(:line, tooltip: true)
+|> Vl.encode_field(:x, "hour", type: :quantitative, title: "Hours from start")
+|> Vl.encode_field(:y, "ecl_lon_deg", type: :quantitative, title: "Ecliptic longitude (°)")
+|> Vl.encode_field(:color, "body", type: :nominal)
+```
+
+### Altitude curve
+
+Same data, switched to altitude — watch bodies rise and set across the day.
+
+```elixir
+alt_rows =
+  for i <- 0..(length(timestamps) - 1), body <- bodies do
+    %{
+      hour: i * 0.25,
+      body: Atom.to_string(body),
+      alt_deg: Enum.at(grid_hz.altitudes[body], i)
+    }
+  end
+
+Vl.new(width: 560, height: 320, title: "Altitude over 24 h")
+|> Vl.data_from_values(alt_rows)
+|> Vl.mark(:line, tooltip: true)
+|> Vl.encode_field(:x, "hour", type: :quantitative, title: "Hours from start")
+|> Vl.encode_field(:y, "alt_deg", type: :quantitative, title: "Altitude (°)")
+|> Vl.encode_field(:color, "body", type: :nominal)
+|> Vl.encode(:stroke_dash,
+  condition: %{test: "datum.alt_deg < 0", value: [4, 4]},
+  value: []
+)
+```
+
+## TimeSeries vs SnapshotPipeline
+
+`TimeSeries` is the **grid path** — it computes positions across hundreds of
+timestamps in a single sweep with no light-time iteration or aberration
+correction. That makes it fast for charts, motion curves, and event scanning
+where a few arcseconds of systematic offset are acceptable.
+
+`SnapshotPipeline` is the **snapshot path** — it evaluates a single instant with
+full corrections (light-time, aberration, precession/nutation). It is what a
+station or extremum *refinement* step calls via `position_fn` once a grid
+candidate is identified. The two paths share the same topocentric frame (GMST rotation +
+true-of-date ecliptic), so grid minima and refined exacts agree to within
+scanning tolerance.
+
+```elixir
+ms_per_sample = Float.round(us / 1000 / length(timestamps), 2)
+
+Kino.Markdown.new("""
+This run: TimeSeries averaged **#{ms_per_sample} ms/sample**
+(#{length(timestamps)} samples, #{Float.round(us / 1000, 1)} ms wall).
+""")
+```
+
+|                       | TimeSeries (grid)                      | SnapshotPipeline (snapshot)        |
+| --------------------- | -------------------------------------- | ---------------------------------- |
+| **Use case**          | Charts, event searches, motion curves  | Precise single-instant observation |
+| **Light-time**        | No                                     | Yes                                |
+| **Aberration**        | No                                     | Yes                                |
+| **Topocentric frame** | GMST, true-of-date ecliptic            | Same (by design)                   |
+| **Typical call**      | `compute/3` + `add_horizon_geometry/2` | `observe/4`                        |
+| **Speed**             | ~0.1–1 ms/sample (grid)              | ~2–5 ms/sample                   |
+
+## Key ideas
+
+* **Grid-first architecture** — scan cheaply, refine precisely. TimeSeries
+  builds the grid; SnapshotPipeline refines the minima. Same frame, different
+  fidelity.
+* **Central-difference motion** — rates reuse already-computed longitudes;
+  no extra SPK evaluations.
+* **Horizon geometry is optional** — `add_horizon_geometry/2` layers on
+  alt/az, ASC/MC, and LST only when the caller needs overlay substrates.
+* **Scaling lever** — want finer resolution? Shrink the interval from 15 min
+  to 5 min. Want a wider sweep? Extend timestamps to a week. The grid handles
+  both.
+* **Frame agreement** — topocentric longitudes from the grid match refinement
+  within scanning tolerance because both paths use the same GMST + true-of-date
+  ecliptic rotation.

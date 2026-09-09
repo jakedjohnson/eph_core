@@ -1,0 +1,430 @@
+# SnapshotPipeline — Public-Surface Tour
+
+```elixir
+Mix.install(
+  [
+    {:eph_core, path: Path.expand("../..", __DIR__)},
+    {:kino, "~> 0.14"},
+    {:kino_vega_lite, "~> 0.1"}
+  ],
+  config: [
+    eph_core: [
+      # Planetary DE440s only. Avoid config_path: :eph_core here — that loads
+      # config.exs asteroid kernels before SPK.Server starts.
+      kernel_base_dir: Path.expand("../../priv", __DIR__),
+      spk_kernels: ["de440s.bsp"]
+    ]
+  ]
+)
+
+Logger.configure(level: :warning)
+```
+
+## Overview
+
+A story-driven walk through `EphCore.SnapshotPipeline.observe/4`, from raw
+inputs to a fully populated `%Observation{}`. Each section maps to a pipeline
+stage so you can see exactly what the engine computes and where the numbers
+live on the struct fields. Change the observer, tweak options, and re-run.
+
+**How to open:** Install [Livebook](https://livebook.dev/), open this `.livemd`,
+evaluate the setup cell. Kernels must already be under `eph_core/priv/ephemeris/`
+(run `mix eph.download_kernels` in the repo first; the setup cell will not start without baseline files).
+
+## Helpers
+
+```elixir
+alias VegaLite, as: Vl
+
+# Kino.Input.utc_datetime/2 reads as NaiveDateTime (UTC) or DateTime depending on version.
+read_utc = fn input ->
+  case Kino.Input.read(input) do
+    %DateTime{} = dt ->
+      DateTime.truncate(dt, :second)
+
+    %NaiveDateTime{} = ndt ->
+      ndt |> DateTime.from_naive!("Etc/UTC") |> DateTime.truncate(:second)
+  end
+end
+
+:ok
+```
+
+## Ready check
+
+```elixir
+priv = EphCore.Ephemeris.Kernels.base_dir()
+spk = Path.join([priv, "ephemeris", "spk", "de440s.bsp"])
+
+Kino.Markdown.new("""
+**EphCore** `#{Application.spec(:eph_core, :vsn)}` · priv `#{priv}`
+
+SPK `de440s.bsp`: #{if File.exists?(spk), do: "✅ present", else: "❌ missing — run `mix eph.download_kernels`"}
+""")
+```
+
+## 1 — Intent: what are we asking?
+
+`observe/4` takes four things: a UTC datetime, a location map, a list of body
+atoms, and an optional keyword list. The pipeline validates everything up front
+in the **Intent** stage — bad inputs fail fast before any real math runs.
+
+```elixir
+lat_in = Kino.Input.number("Latitude (°)", default: 44.9778)
+lon_in = Kino.Input.number("Longitude (°)", default: -93.2650)
+height_in = Kino.Input.number("Height (m)", default: 250)
+utc_in = Kino.Input.utc_datetime("UTC", default: ~N[2026-07-21 17:00:00])
+
+Kino.Layout.grid([lat_in, lon_in, height_in, utc_in], columns: 2)
+```
+
+```elixir
+location = %{
+  lat: Kino.Input.read(lat_in),
+  lon: Kino.Input.read(lon_in),
+  height: Kino.Input.read(height_in)
+}
+
+datetime = read_utc.(utc_in)
+
+bodies = [:sun, :moon, :mercury, :venus, :mars, :jupiter, :saturn]
+
+Kino.Markdown.new("""
+**Inputs locked**
+
+| param | value |
+|-------|-------|
+| datetime | `#{DateTime.to_iso8601(datetime)}` |
+| location | `#{location.lat}°, #{location.lon}°` @ #{location.height} m |
+| bodies | `#{inspect(bodies)}` |
+| opts | `[]` (all defaults) |
+""")
+```
+
+## 2 — Run default observe
+
+One function call. Everything downstream is computed from these inputs.
+
+```elixir
+{us, {:ok, obs}} =
+  :timer.tc(fn ->
+    EphCore.SnapshotPipeline.observe(datetime, location, bodies)
+  end)
+
+Kino.Markdown.new("""
+### Result: `%Observation{}`
+
+Computed **#{length(bodies)} bodies** from
+`#{location.lat}, #{location.lon}` (#{location.height} m) at
+`#{DateTime.to_iso8601(datetime)}` in **#{Float.round(us / 1000, 1)} ms**.
+""")
+```
+
+Top-level fields on the returned struct:
+
+| field                    | type                                 | what it holds                                  |
+| ------------------------ | ------------------------------------ | ---------------------------------------------- |
+| `intent`                 | `Intent.t()`                         | validated inputs + config (immutable contract) |
+| `epoch`                  | `AstronomicalTime.t()`               | JD scales + ΔT                                |
+| `earth_orientation`      | `EarthOrientation.t()`               | GMST/GAST + rotation matrix                    |
+| `observer_position`      | `ObserverPosition.t()`               | ECEF, inertial, local sidereal time            |
+| `bodies`                 | `%{atom => SkyPosition.t()}`         | alt/az per body                                |
+| `solar_system_positions` | `%{atom => SolarSystemPosition.t()}` | ecliptic lon, RA/Dec, range                    |
+| `motion`                 | `%{atom => map()}`                   | ecliptic lon rates + retrograde flag           |
+| `computed_at`            | `DateTime.t()`                       | wall-clock timestamp                           |
+| `engine_version`         | `String.t()`                         | EphCore vsn                                    |
+
+## 3 — Epoch (astronomical time scales)
+
+The pipeline's first real computation: convert UTC → JD_UTC → JD_UT1 → JD_TT.
+ΔT (the difference between TT and UT1) comes from IERS tables by default.
+
+```elixir
+epoch = obs.epoch
+
+epoch_rows = [
+  %{scale: "JD_UTC", value: epoch.jd_utc, notes: "Julian Date in UTC"},
+  %{scale: "JD_UT1", value: epoch.jd_ut1, notes: "UT1 — tracks Earth rotation"},
+  %{scale: "JD_TT", value: epoch.jd_tt, notes: "Terrestrial Time — uniform atomic clock"},
+  %{scale: "ΔT (s)", value: Float.round(epoch.delta_t_seconds, 4), notes: "TT − UT1 (#{epoch.delta_t_source})"}
+]
+
+Kino.DataTable.new(epoch_rows, name: "Epoch — time scales")
+```
+
+**Why three time scales?** UTC is civil time with leap seconds. UT1 tracks
+Earth's actual rotation angle (needed for sidereal time). TT is a uniform
+clock for orbital mechanics. The ~69 s gap between them is ΔT — it drifts
+as Earth's rotation slows.
+
+## 4 — Earth orientation (sidereal time)
+
+The pipeline rotates from the Earth-fixed frame (ECEF) to the inertial frame
+(ICRF) using sidereal time. The default model is GMST; GAST adds nutation.
+
+```elixir
+eo = obs.earth_orientation
+
+eo_rows = [
+  %{field: "GMST (°)", value: Float.round(eo.gmst_degrees, 6)},
+  %{field: "GAST (°)", value: if(eo.gast_degrees, do: Float.round(eo.gast_degrees, 6), else: "—  (enable with models: %{earth_orientation: :gast})")},
+  %{field: "model", value: eo.model},
+  %{field: "precession/nutation applied", value: eo.precession_nutation_applied},
+  %{field: "polar motion applied", value: eo.polar_motion_applied}
+]
+
+Kino.DataTable.new(eo_rows, name: "Earth orientation")
+```
+
+## 5 — Observer position
+
+ECEF from WGS-84 geodetic, then rotated into inertial space by the sidereal
+rotation matrix. Local sidereal time (LAST/LMST) tells you which part of the
+celestial sphere is overhead right now.
+
+```elixir
+op = obs.observer_position
+
+{ix, iy, iz} = op.inertial_position_km
+
+op_rows = [
+  %{field: "LMST (°)", value: Float.round(op.lmst_deg, 4), notes: "Local Mean Sidereal Time = GMST + longitude"},
+  %{field: "LAST (°)", value: Float.round(op.last_deg, 4), notes: "Local Apparent Sidereal Time = GAST + longitude"},
+  %{field: "inertial X (km)", value: Float.round(ix, 3), notes: ""},
+  %{field: "inertial Y (km)", value: Float.round(iy, 3), notes: ""},
+  %{field: "inertial Z (km)", value: Float.round(iz, 3), notes: ""},
+  %{field: "ellipsoid", value: op.ellipsoid, notes: ""},
+  %{field: "frame", value: op.frame, notes: ""}
+]
+
+Kino.DataTable.new(op_rows, name: "Observer position")
+```
+
+## 6 — Solar system positions (ecliptic longitude)
+
+For each body, the pipeline queries DE440s for the geocentric ICRF state vector
+and converts to ecliptic longitude/latitude in the configured frame (default:
+true-of-date). RA/Dec come straight from the ICRF vector.
+
+```elixir
+ssp_rows =
+  for body <- bodies do
+    ssp = obs.solar_system_positions[body]
+
+    %{
+      body: body,
+      ecliptic_lon: Float.round(ssp.ecliptic_longitude, 4),
+      ecliptic_lat: Float.round(ssp.ecliptic_latitude, 4),
+      ra_deg: Float.round(ssp.right_ascension, 4),
+      dec_deg: Float.round(ssp.declination, 4),
+      range_km: Float.round(ssp.geocentric_range_km, 0),
+      frame: ssp.ecliptic_frame
+    }
+  end
+
+Kino.DataTable.new(ssp_rows, name: "Solar system positions — geocentric")
+```
+
+```elixir
+Vl.new(width: 560, height: 300, title: "Ecliptic longitude by body (true-of-date)")
+|> Vl.data_from_values(ssp_rows)
+|> Vl.mark(:point, size: 120, filled: true)
+|> Vl.encode_field(:x, "ecliptic_lon", type: :quantitative, title: "Ecliptic longitude (°)", scale: [domain: [0, 360]])
+|> Vl.encode_field(:y, "body", type: :nominal, sort: Enum.map(ssp_rows, & &1.body))
+|> Vl.encode_field(:color, "ecliptic_lon", type: :quantitative, scale: [scheme: "sinebow"])
+```
+
+## 7 — Bodies (alt/az — your local sky)
+
+`obs.bodies` holds the **topocentric** sky position for each target — what
+you'd see if you looked up. Altitude > 0 means the body is above the horizon.
+
+```elixir
+sky_rows =
+  for body <- bodies do
+    sky = obs.bodies[body]
+
+    %{
+      body: body,
+      altitude_deg: Float.round(sky.altitude_deg, 2),
+      azimuth_deg: Float.round(sky.azimuth_deg, 2),
+      topo_range_km: Float.round(sky.topocentric_range_km, 0),
+      topo_ra: Float.round(sky.topocentric_right_ascension, 4),
+      topo_dec: Float.round(sky.topocentric_declination, 4),
+      above_horizon: sky.altitude_deg > 0
+    }
+  end
+
+Kino.DataTable.new(sky_rows, name: "Bodies — topocentric sky")
+```
+
+```elixir
+Vl.new(width: 520, height: 280, title: "Altitude by body")
+|> Vl.data_from_values(sky_rows)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "body", type: :nominal, sort: Enum.map(sky_rows, & &1.body))
+|> Vl.encode_field(:y, "altitude_deg", type: :quantitative, title: "Altitude (°)")
+|> Vl.encode_field(:color, "above_horizon", type: :nominal, scale: [range: ["#cc3333", "#33aa55"]])
+```
+
+## 8 — Motion (ecliptic longitude rates)
+
+The motion stage samples the ecliptic longitude at `t ± dt_minutes` (default
+30 min) and computes a central-difference rate in °/day. Negative rate =
+retrograde. Station searches use this rate to find longitude-rate zero-crossings.
+
+```elixir
+motion_rows =
+  for body <- bodies do
+    m = obs.motion[body]
+
+    %{
+      body: body,
+      rate_deg_per_day: Float.round(m.ecliptic_lon_rate_deg_per_day, 4),
+      retrograde: m.retrograde,
+      dt_minutes: m.dt_minutes,
+      frame: m.frame
+    }
+  end
+
+Kino.DataTable.new(motion_rows, name: "Motion — ecliptic longitude rates")
+```
+
+```elixir
+Vl.new(width: 520, height: 280, title: "Ecliptic longitude rate (°/day)")
+|> Vl.data_from_values(motion_rows)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "body", type: :nominal, sort: Enum.map(motion_rows, & &1.body))
+|> Vl.encode_field(:y, "rate_deg_per_day", type: :quantitative, title: "°/day")
+|> Vl.encode_field(:color, "retrograde", type: :nominal, scale: [range: ["#33aa55", "#cc3333"]])
+```
+
+## 9 — Options: geometric vs apparent geocentric
+
+By default the pipeline produces **geometric** positions — where the body
+actually *is* right now. Enable `light_time: true` + `aberration: true` to get
+**apparent geocentric** positions — where the body *appears* from Earth's
+center after accounting for the finite speed of light and Earth's orbital
+velocity. Published almanacs use apparent geocentric.
+
+The apparent fields only populate when *both* flags are true.
+
+```elixir
+compare_bodies = [:mars, :jupiter, :saturn]
+
+{:ok, obs_geo} =
+  EphCore.SnapshotPipeline.observe(datetime, location, compare_bodies)
+
+{:ok, obs_app} =
+  EphCore.SnapshotPipeline.observe(datetime, location, compare_bodies,
+    corrections: %{light_time: true, aberration: true}
+  )
+
+matrix =
+  for body <- compare_bodies do
+    geo_lon = obs_geo.solar_system_positions[body].ecliptic_longitude
+    app_lon = obs_app.solar_system_positions[body].apparent_geocentric_ecliptic_longitude
+
+    geo_rate = obs_geo.motion[body].ecliptic_lon_rate_deg_per_day
+    app_rate = obs_app.motion[body][:apparent_geocentric_ecliptic_lon_rate_deg_per_day]
+
+    %{
+      body: body,
+      geometric_lon: Float.round(geo_lon, 6),
+      apparent_lon: if(app_lon, do: Float.round(app_lon, 6)),
+      delta_arcsec: if(app_lon, do: Float.round(abs(app_lon - geo_lon) * 3600, 2)),
+      geometric_rate: Float.round(geo_rate, 4),
+      apparent_rate: if(app_rate, do: Float.round(app_rate, 4))
+    }
+  end
+
+Kino.DataTable.new(matrix, name: "Geometric vs apparent geocentric")
+```
+
+The `delta_arcsec` column shows how much the apparent position shifts from the
+geometric one. For Mars at ~1 AU the offset is modest; for Saturn at ~10 AU
+light-time alone adds several arcseconds. Near a **retrograde station** those
+few arcseconds translate to **hours** of timing error in station-crossing
+predictions.
+
+## 10 — Optional GAST model
+
+Swap the earth orientation model from GMST (mean sidereal time) to GAST
+(apparent sidereal time, which includes nutation). The difference is tiny
+(~0.001° typically) but measurable.
+
+```elixir
+{:ok, obs_gast} =
+  EphCore.SnapshotPipeline.observe(datetime, location, [:sun],
+    models: %{earth_orientation: :gast}
+  )
+
+gast_rows = [
+  %{field: "GMST (°)", gmst_model: Float.round(obs.earth_orientation.gmst_degrees, 6), gast_model: Float.round(obs_gast.earth_orientation.gmst_degrees, 6)},
+  %{field: "GAST (°)", gmst_model: "—", gast_model: Float.round(obs_gast.earth_orientation.gast_degrees, 6)},
+  %{field: "LAST (°)", gmst_model: Float.round(obs.observer_position.last_deg, 6), gast_model: Float.round(obs_gast.observer_position.last_deg, 6)},
+  %{field: "LMST (°)", gmst_model: Float.round(obs.observer_position.lmst_deg, 6), gast_model: Float.round(obs_gast.observer_position.lmst_deg, 6)}
+]
+
+Kino.DataTable.new(gast_rows, name: "GMST vs GAST model comparison")
+```
+
+Both models produce the same GMST and LMST (those are computed from the
+UT1 epoch alone). GAST adds the equation of the equinoxes (nutation in
+longitude × cos(obliquity)), which shifts LAST and the rotation matrix.
+For most demos GMST is fine — GAST matters when you need sub-arcsecond
+accuracy or want to match USNO tables exactly.
+
+## 11 — The pipeline as a story
+
+### Pipeline flow — one slide version
+
+```
+observe(datetime, location, bodies, opts)
+  │
+  ├─ 00 Intent         validate & normalize inputs → immutable contract
+  ├─ 01 AstronomicalTime   UTC → JD_UTC → JD_UT1 → JD_TT (ΔT from IERS)
+  ├─ 02 EarthOrientation   JD_UT1 + JD_TT → GMST (or GAST) → rotation matrix
+  ├─ 03 ObserverPosition   geodetic → ECEF → inertial (via rotation matrix)
+  │
+  │   ┌── per body (parallel when ≥ 3 targets) ──┐
+  ├─ 04 SolarSystemPosition   DE440s query → geocentric ICRF → ecliptic lon
+  ├─ 05 Motion                  central difference at t±30 min → °/day rate
+  ├─ 06 SkyPosition             geocentric − observer → topocentric → alt/az
+  │   └──────────────────────────────────────────┘
+  │
+  └─ 07 Manifest        package into %Observation{} with provenance
+```
+
+**Shared context** (stages 01–03) runs once. **Per-body** stages (04–06) fan
+out with `Task.async_stream` when you pass ≥ 3 bodies. The final
+`%Observation{}` struct is what `Manifest.finalize/1` returns.
+
+## Skyfield cross-check
+
+One-shot EphCore vs Skyfield timing + like-for-like diffs live in
+[`02_skyfield_snapshot.livemd`](../02_applications/02_skyfield_snapshot.livemd) (Pythonx /
+`uv`, expandable without crowding this pipeline tour).
+
+## Key ideas
+
+1. **One function, seven stages** — `observe/4` reads like a recipe: validate,
+   compute shared context, fan out per-body, package. Every stage is a pure
+   transform on an immutable `%Snapshot{}`.
+
+2. **ΔT is the gap you didn't know existed** — 69 seconds between atomic clocks
+   and Earth's wobbly rotation. IERS tables give you the real number; the
+   approximate constant is fine for casual work, wrong for stations.
+
+3. **Geometric vs apparent: a few arcseconds that matter** — light-time +
+   aberration shift the longitude just enough to move a retrograde station
+   crossing by hours. Default pipeline is geometric; add two flags for apparent
+   geocentric.
+
+4. **The Observation struct is your receipt** — `intent` for what you asked,
+   `epoch` through `motion` for what the engine computed, `computed_at` +
+   `engine_version` for provenance. Serialize it, diff it, test against it.
+
+5. **Fan-out is free** — per-body stages use `Task.async_stream` when body
+   count ≥ 3. Same API, automatic concurrency. Scale from a single Mars lookup
+   to an 8-city × 7-body matrix in one more line.

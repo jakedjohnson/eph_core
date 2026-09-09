@@ -1,0 +1,405 @@
+# Tour — From Wall Clock to Sidereal Time
+
+```elixir
+Mix.install(
+  [
+    {:eph_core, path: Path.expand("../..", __DIR__)},
+    {:kino, "~> 0.14"}
+  ],
+  config: [
+    eph_core: [
+      # Planetary DE440s only. Avoid config_path: :eph_core here — that loads
+      # config.exs asteroid kernels before SPK.Server starts.
+      kernel_base_dir: Path.expand("../../priv", __DIR__),
+      spk_kernels: ["de440s.bsp"]
+    ]
+  ]
+)
+
+Logger.configure(level: :warning)
+```
+
+## Overview
+
+The clockwork chain that answers "what's overhead right now?" starts with a wall
+clock and ends with Local Apparent Sidereal Time (LAST). Every link in this
+chain is a GenServer, an ETS table, or a pure function — all running in BEAM.
+
+This notebook walks the full path:
+
+```
+UTC → TAI → TT → JD → UT1 → GMST → GAST → LMST / LAST
+```
+
+Every observer on Earth shares a single UTC instant, but local sidereal time — the
+right ascension currently on the meridian — depends on longitude. Time scales are
+the bookkeeping that makes this precise.
+
+**How to open:** Install [Livebook](https://livebook.dev/), open this `.livemd`,
+evaluate the setup cell.
+
+## Helpers
+
+```elixir
+alias EphCore.AstronomicalTime.{
+  InternationalAtomicTime,
+  TerrestrialTime,
+  JulianDay,
+  UniversalTimeOne
+}
+
+alias EphCore.EarthOrientation.Sidereal
+alias EphCore.Geometry.Horizon
+
+# Kino.Input.utc_datetime/2 reads as NaiveDateTime (UTC) or DateTime depending on version.
+read_utc = fn input ->
+  case Kino.Input.read(input) do
+    %DateTime{} = dt ->
+      DateTime.truncate(dt, :second)
+
+    %NaiveDateTime{} = ndt ->
+      ndt |> DateTime.from_naive!("Etc/UTC") |> DateTime.truncate(:second)
+  end
+end
+
+:ok
+```
+
+## Ready check
+
+```elixir
+# ETS tables are named after their GenServer modules (not :leap_seconds / :eop atoms).
+leap_mod = EphCore.AstronomicalTime.Tables.LeapSeconds
+eop_mod = EphCore.AstronomicalTime.Tables.EarthOrientationParameters
+
+Kino.Markdown.new("""
+**EphCore** `#{Application.spec(:eph_core, :vsn)}` loaded.
+
+GenServers / ETS alive:
+- LeapSeconds: #{if Process.whereis(leap_mod) && :ets.whereis(leap_mod) != :undefined, do: "✅", else: "❌"}
+- EOP: #{if Process.whereis(eop_mod) && :ets.whereis(eop_mod) != :undefined, do: "✅", else: "❌"}
+""")
+```
+
+## Step 1 — Start from a wall-clock UTC
+
+Pick any UTC instant. Minneapolis longitude is −93.265° (west of Greenwich).
+
+```elixir
+utc_in = Kino.Input.utc_datetime("Wall-clock UTC", default: ~N[2026-07-21 17:00:00])
+lon_in = Kino.Input.number("Observer longitude (°)", default: -93.2650)
+lat_in = Kino.Input.number("Observer latitude (°)", default: 44.9778)
+
+Kino.Layout.grid([utc_in, lon_in, lat_in], columns: 3)
+```
+
+```elixir
+utc = read_utc.(utc_in)
+lon_deg = Kino.Input.read(lon_in)
+lat_deg = Kino.Input.read(lat_in)
+
+Kino.Markdown.new("**Epoch:** `#{utc}` · **Longitude:** #{lon_deg}° · **Latitude:** #{lat_deg}°")
+```
+
+## Step 2 — UTC → TAI (leap seconds)
+
+TAI = UTC + accumulated leap seconds. The offset is looked up from an ETS table
+that `EphCore.AstronomicalTime.Tables.LeapSeconds` populates at boot from the
+IERS leap-second file.
+
+```elixir
+tai = InternationalAtomicTime.from_utc(utc)
+
+leap_offset_s = DateTime.diff(tai, utc, :microsecond) / 1_000_000
+
+Kino.Markdown.new("""
+| Scale | Value |
+|-------|-------|
+| UTC | `#{utc}` |
+| TAI | `#{tai}` |
+| TAI − UTC | **#{leap_offset_s} s** (leap seconds since 1972) |
+""")
+```
+
+## Step 3 — TAI → TT (+32.184 s)
+
+Terrestrial Time is the theorist's clock — uniform, monotonic, and free from
+Earth's rotational hiccups. The fixed 32.184 s offset is a historical artifact
+tying TT back to the old Ephemeris Time scale.
+
+```elixir
+tt = TerrestrialTime.from_utc(utc)
+
+tt_tai_offset = DateTime.diff(tt, tai, :microsecond) / 1_000_000
+tt_utc_offset = DateTime.diff(tt, utc, :microsecond) / 1_000_000
+
+Kino.Markdown.new("""
+| Scale | Value |
+|-------|-------|
+| TT | `#{tt}` |
+| TT − TAI | #{tt_tai_offset} s (fixed) |
+| TT − UTC | **#{tt_utc_offset} s** |
+""")
+```
+
+## Step 4 — Julian Days: JD_UTC, MJD, JD_TT
+
+Julian Day is the astronomer's day counter — a continuous float since
+4713 BC noon. MJD trims the leading digits for modern convenience.
+
+```elixir
+jd_utc = JulianDay.from_datetime(utc)
+mjd = JulianDay.modified_julian_day(jd_utc)
+jd_tt = JulianDay.from_datetime(tt)
+
+Kino.Markdown.new("""
+| Quantity | Value |
+|----------|-------|
+| JD(UTC) | #{jd_utc} |
+| MJD | #{mjd} |
+| JD(TT) | #{jd_tt} |
+| JD(TT) − JD(UTC) | #{Float.round((jd_tt - jd_utc) * 86400, 3)} s |
+""")
+```
+
+## Step 5 — UTC → UT1 via EOP
+
+UT1 is Earth's *actual* rotation angle — it drifts from UTC by up to ±0.9 s
+before a leap second corrects it. The (UT1−UTC) offset comes from IERS Earth
+Orientation Parameters, loaded into ETS at startup.
+
+```elixir
+ut1_minus_utc = UniversalTimeOne.delta_for_mjd_utc(mjd)
+jd_ut1 = UniversalTimeOne.apply_delta(jd_utc, ut1_minus_utc)
+
+delta_t = (jd_tt - jd_ut1) * 86400
+
+Kino.Markdown.new("""
+| Quantity | Value |
+|----------|-------|
+| UT1 − UTC | #{Float.round(ut1_minus_utc, 7)} s |
+| JD(UT1) | #{jd_ut1} |
+| **ΔT** = TT − UT1 | **#{Float.round(delta_t, 3)} s** |
+
+ΔT encapsulates everything: leap seconds + 32.184 s − the sub-second EOP correction.
+Currently ~69 s and growing ~1 s/year as Earth's rotation decelerates.
+""")
+```
+
+## Step 6 — GMST (Greenwich Mean Sidereal Time)
+
+GMST tells you which right ascension is on the Greenwich meridian *ignoring
+nutation*. The IAU 2006 formula needs **both** `jd_ut1` (Earth's actual spin)
+and `jd_tt` (smooth precession timebase).
+
+Module: `EphCore.EarthOrientation.Sidereal` (`lib/eph_core/earth_orientation/sidereal.ex`)
+
+The formula splits Earth rotation (UT1 centuries) from precession drift (TT centuries):
+
+```
+GMST(s) = 67310.54841 + (876600×3600 + 8640184.812866)·T_UT1
+        + 0.093104·T_TT² − 6.2×10⁻⁶·T_TT³
+```
+
+```elixir
+gmst_deg = Sidereal.gmst_iau_2006(jd_ut1, jd_tt)
+gmst_hours = Sidereal.lst_to_hours(gmst_deg)
+
+{gmst_h, gmst_m, gmst_s} = {
+  trunc(gmst_hours),
+  trunc(rem(trunc(gmst_hours * 60), 60)),
+  Float.round(:math.fmod(gmst_hours * 3600, 60), 2)
+}
+
+Kino.Markdown.new("""
+**GMST** = #{Float.round(gmst_deg, 6)}° = #{gmst_h}h #{gmst_m}m #{gmst_s}s
+""")
+```
+
+## Step 7 — GAST (Greenwich Apparent Sidereal Time)
+
+GAST = GMST + equation of equinoxes. The equation of equinoxes accounts for
+nutation — the ~9″ wobble of Earth's axis caused primarily by the 18.6-year
+lunar nodal cycle.
+
+```elixir
+eq_eq_deg = Sidereal.equation_of_equinoxes(jd_tt)
+gast_deg = Sidereal.gast_iau_2006(jd_ut1, jd_tt)
+gast_hours = Sidereal.lst_to_hours(gast_deg)
+
+Kino.Markdown.new("""
+| Quantity | Value |
+|----------|-------|
+| Equation of equinoxes | #{Float.round(eq_eq_deg * 3600, 4)}″ (#{Float.round(eq_eq_deg, 8)}°) |
+| GMST | #{Float.round(gmst_deg, 6)}° |
+| **GAST** | **#{Float.round(gast_deg, 6)}°** = #{Float.round(gast_hours, 6)} h |
+| GAST − GMST | #{Float.round((gast_deg - gmst_deg) * 3600, 4)}″ |
+""")
+```
+
+The simplified equation of equinoxes uses a single-term nutation model
+(the dominant 18.6-year lunar node term). For sub-arcsecond work, the full
+IAU 2000A 106-term series is available via `Sidereal.nutation_iau2000a/1`.
+
+## Step 8 — LMST / LAST (Local Sidereal Time)
+
+Local = Greenwich + longitude. That's it. Your meridian's offset from Greenwich
+*is* the longitude, expressed in degrees.
+
+```elixir
+lmst_deg = Sidereal.gmst_to_lst(gmst_deg, lon_deg)
+last_deg = Sidereal.gmst_to_lst(gast_deg, lon_deg)
+
+lmst_hours = Sidereal.lst_to_hours(lmst_deg)
+last_hours = Sidereal.lst_to_hours(last_deg)
+
+format_hms = fn hours ->
+  h = trunc(hours)
+  m = trunc(:math.fmod(hours * 60, 60))
+  s = Float.round(:math.fmod(hours * 3600, 60), 2)
+  "#{h}h #{m}m #{s}s"
+end
+
+Kino.Markdown.new("""
+| Quantity | Degrees | Hours |
+|----------|---------|-------|
+| **LMST** | #{Float.round(lmst_deg, 4)}° | #{format_hms.(lmst_hours)} |
+| **LAST** | #{Float.round(last_deg, 4)}° | #{format_hms.(last_hours)} |
+
+Minneapolis at longitude #{lon_deg}° shifts sidereal time by
+#{Float.round(lon_deg / 15, 2)} hours from Greenwich — *where you stand changes the sky.*
+
+`gmst_to_lst/2` is just addition + `normalize_angle/1` — the simplest function
+in the chain, but it's the one that makes the sky *yours*.
+""")
+```
+
+## Step 9 — Cross-check against SnapshotPipeline
+
+The pipeline computes all of this internally. Let's verify our hand-rolled
+values match the pipeline's output when we request `models: %{earth_orientation: :gast}`.
+
+```elixir
+location = %{lat: lat_deg, lon: lon_deg, height: 250}
+
+{:ok, obs} =
+  EphCore.SnapshotPipeline.observe(utc, location, [:sun],
+    models: %{earth_orientation: :gast, delta_t: :iers}
+  )
+
+checks = [
+  {"JD(UT1)", jd_ut1, obs.epoch.jd_ut1},
+  {"JD(TT)", jd_tt, obs.epoch.jd_tt},
+  {"ΔT (s)", delta_t, obs.epoch.delta_t_seconds},
+  {"GMST (°)", gmst_deg, obs.earth_orientation.gmst_degrees},
+  {"GAST (°)", gast_deg, obs.earth_orientation.gast_degrees},
+  {"LMST (°)", lmst_deg, obs.observer_position.lmst_deg},
+  {"LAST (°)", last_deg, obs.observer_position.last_deg}
+]
+
+rows =
+  Enum.map(checks, fn {label, ours, pipeline} ->
+    diff = abs(ours - pipeline)
+
+    %{
+      quantity: label,
+      notebook: Float.round(ours, 10),
+      pipeline: Float.round(pipeline, 10),
+      diff: if(diff < 1.0e-12, do: "exact", else: "#{Float.round(diff, 14)}")
+    }
+  end)
+
+Kino.DataTable.new(rows, name: "Notebook vs Pipeline cross-check")
+```
+
+## Step 10 — Bonus: Ecliptic Longitude at the Eastern Horizon
+
+The Ascendant in classical astronomy is the ecliptic longitude rising on the
+eastern horizon. It's computed from LAST + latitude + obliquity — a direct
+application of the sidereal time we just derived.
+
+```elixir
+horizon_result =
+  Horizon.ecliptic_lon_at_east_horizon(jd_tt, lat_deg, lon_deg, jd_ut1: jd_ut1)
+
+Kino.Markdown.new("""
+| Quantity | Value |
+|----------|-------|
+| East horizon ecliptic longitude | **#{Float.round(horizon_result.east_horizon_ecliptic_longitude, 4)}°** |
+| LST used (from GAST) | #{Float.round(horizon_result.lst, 4)}° |
+| Obliquity (true of date) | #{Float.round(horizon_result.obliquity, 6)}° |
+| Sidereal time type | #{horizon_result.sidereal_time_type} |
+
+This is the classical "Ascendant" — the ecliptic degree rising over the
+eastern horizon at this moment and place. It changes by ~1° every 4 minutes
+as Earth spins.
+""")
+```
+
+## Pitfalls & Notes
+
+### ⚠️ Pitfalls
+
+1. **Default pipeline uses `:gmst`** — pass `models: %{earth_orientation: :gast}`
+   to get apparent sidereal time and a non-nil `gast_degrees` field.
+
+2. **`gast_iau_2006` uses simplified equation of equinoxes** — a single-term
+   truncation of the 18.6-year nodal cycle (~0.1″ error). The full 106-term
+   IAU 2000A nutation is used in `true_precession_matrix_iau2006/1` for
+   coordinate frame rotations.
+
+3. **EOP and LeapSeconds GenServers must be running** — they boot with the
+   application supervisor and populate ETS tables. If you see `nil` from
+   `delta_for_mjd_utc/1`, the EOP table hasn't loaded yet.
+
+4. **ΔT grows ~1 s/year** — the approximate model uses a fixed 69.184 s;
+   pass `models: %{delta_t: :iers}` to use the EOP-derived value.
+
+5. **`apply_delta/2` takes *seconds*, not days** — it divides by 86400
+   internally. Easy to double-convert if you're not careful.
+
+### Key ideas
+
+* **Time scales as BEAM ETS tables** — LeapSeconds, EOP, and SPK kernels are
+  GenServer-backed ETS stores. The pipeline reads them lock-free with
+  `:ets.lookup/2`. No external database, no HTTP calls at query time.
+
+* **Longitude shifts sidereal time** — LAST differs from GAST by exactly your
+  longitude in degrees. Two observers share a UTC instant but see different
+  meridians. The Ascendant at the horizon changes sign every ~2 hours.
+
+## The Full Chain (summary diagram)
+
+```
+┌──────────┐   +37s leap    ┌──────────┐   +32.184s    ┌──────────┐
+│   UTC    │ ─────────────→ │   TAI    │ ────────────→ │    TT    │
+└──────────┘                └──────────┘               └──────────┘
+     │                                                       │
+     │ JulianDay.from_datetime/1                             │ JulianDay.from_datetime/1
+     ▼                                                       ▼
+┌──────────┐                                           ┌──────────┐
+│  JD_UTC  │                                           │  JD_TT   │
+└──────────┘                                           └──────────┘
+     │                                                       │
+     │ + (UT1−UTC)/86400                                     │
+     ▼                                                       │
+┌──────────┐         gmst_iau_2006(jd_ut1, jd_tt)            │
+│  JD_UT1  │ ────────────────────────────────────────────────┤
+└──────────┘                                                 │
+                                                             ▼
+                                                       ┌──────────┐
+                                                       │   GMST   │
+                                                       └──────────┘
+                                                             │
+                                                 + eq_of_equinoxes(jd_tt)
+                                                             ▼
+                                                       ┌──────────┐
+                                                       │   GAST   │
+                                                       └──────────┘
+                                                             │
+                                                      + longitude
+                                                             ▼
+                                                       ┌──────────┐
+                                                       │   LAST   │
+                                                       └──────────┘
+```
